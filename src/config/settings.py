@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     claude_cli_path: Optional[str] = Field(
         None, description="Path to Claude CLI executable"
     )
+    claude_default_agent: Optional[str] = Field(
+        None, description="Default agent name for new sessions (e.g. 'meta')"
+    )
     anthropic_api_key: Optional[SecretStr] = Field(
         None,
         description="Anthropic API key for SDK (optional if CLI logged in)",

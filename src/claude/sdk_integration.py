@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import json
+
 import structlog
 from claude_agent_sdk import (
     AssistantMessage,
@@ -128,6 +130,9 @@ def _make_can_use_tool_callback(
 class ClaudeSDKManager:
     """Manage Claude Code SDK integration."""
 
+    # Env vars from ~/.claude/settings.json that should be synced
+    _CLAUDE_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+
     def __init__(
         self,
         config: Settings,
@@ -137,13 +142,48 @@ class ClaudeSDKManager:
         self.config = config
         self.security_validator = security_validator
 
-        # Set up environment for Claude Code SDK if API key is provided
-        # If no API key is provided, the SDK will use existing CLI authentication
+        # Set up environment for Claude Code SDK
+        # Priority: .env ANTHROPIC_API_KEY > ~/.claude/settings.json env section
         if config.anthropic_api_key_str:
             os.environ["ANTHROPIC_API_KEY"] = config.anthropic_api_key_str
             logger.info("Using provided API key for Claude SDK authentication")
         else:
-            logger.info("No API key provided, using existing Claude CLI authentication")
+            # Sync env vars from ~/.claude/settings.json (cc-switch compatible)
+            self._sync_claude_settings_env()
+
+    @classmethod
+    def _sync_claude_settings_env(cls) -> None:
+        """Read ~/.claude/settings.json and apply its env section to os.environ.
+
+        This ensures cc-switch configuration changes are picked up dynamically.
+        Called before each CLI invocation for live sync.
+        """
+        # Prevent "nested session" error when bot is launched from Claude Code
+        os.environ.pop("CLAUDECODE", None)
+
+        try:
+            with open(cls._CLAUDE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            env_section = settings.get("env", {})
+            if env_section:
+                for key, value in env_section.items():
+                    os.environ[key] = str(value)
+                logger.info(
+                    "Synced env from ~/.claude/settings.json",
+                    keys=list(env_section.keys()),
+                )
+            else:
+                logger.info(
+                    "No env section in ~/.claude/settings.json, "
+                    "using existing CLI authentication"
+                )
+        except FileNotFoundError:
+            logger.warning("~/.claude/settings.json not found")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "Failed to read ~/.claude/settings.json",
+                error=str(e),
+            )
 
     async def execute_command(
         self,
@@ -155,6 +195,10 @@ class ClaudeSDKManager:
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
+
+        # Re-sync env from settings.json before each call (cc-switch live reload)
+        if not self.config.anthropic_api_key_str:
+            self._sync_claude_settings_env()
 
         logger.info(
             "Starting Claude SDK command",
@@ -184,6 +228,14 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            # When using --agent, use append-system-prompt so agent's AGENT.md
+            # identity is preserved; otherwise use system-prompt directly.
+            use_agent = bool(self.config.claude_default_agent)
+            if use_agent:
+                system_prompt_value = {"type": "preset", "append": base_prompt}
+            else:
+                system_prompt_value = base_prompt
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -192,6 +244,18 @@ class ClaudeSDKManager:
             else:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+            # Build extra CLI args
+            extra_args: Dict[str, str | None] = {}
+            if self.config.claude_default_agent:
+                extra_args["agent"] = self.config.claude_default_agent
+
+            logger.info(
+                "SDK options",
+                extra_args=extra_args,
+                system_prompt_type=type(system_prompt_value).__name__,
+                default_agent=self.config.claude_default_agent,
+            )
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(
@@ -206,9 +270,10 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
-                system_prompt=base_prompt,
-                setting_sources=["project"],
+                system_prompt=system_prompt_value,
+                setting_sources=["user", "project"],
                 stderr=_stderr_callback,
+                extra_args=extra_args,
             )
 
             # Pass MCP server configuration if enabled

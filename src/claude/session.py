@@ -129,7 +129,11 @@ class SessionManager:
         project_path: Path,
         session_id: Optional[str] = None,
     ) -> ClaudeSession:
-        """Get existing session or create new one."""
+        """Get existing session or create new one.
+
+        If session_id is provided but not found in storage, it is treated as
+        an external desktop session and a wrapper is created to resume it.
+        """
         logger.info(
             "Getting or creating session",
             user_id=user_id,
@@ -137,7 +141,7 @@ class SessionManager:
             session_id=session_id,
         )
 
-        # Check for existing session
+        # Check for existing session in active cache
         if session_id and session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             if session.user_id != user_id:
@@ -158,6 +162,26 @@ class SessionManager:
                 self.active_sessions[session_id] = session
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
+
+        # If session_id looks like a valid UUID but wasn't found in our storage,
+        # treat it as an external desktop session and create a wrapper to resume it.
+        if session_id and len(session_id) >= 32 and "-" in session_id:
+            logger.info(
+                "Creating wrapper for external desktop session",
+                session_id=session_id,
+                project_path=str(project_path),
+            )
+            external_session = ClaudeSession(
+                session_id=session_id,
+                user_id=user_id,
+                project_path=project_path,
+                created_at=datetime.now(UTC),
+                last_used=datetime.now(UTC),
+                is_new_session=False,  # Not new — we want to RESUME it
+            )
+            self.active_sessions[session_id] = external_session
+            await self.storage.save_session(external_session)
+            return external_session
 
         # Check user session limit
         user_sessions = await self._get_user_sessions(user_id)

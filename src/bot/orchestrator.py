@@ -29,6 +29,15 @@ from telegram.ext import (
 )
 
 from ..claude.sdk_integration import StreamUpdate
+from ..claude.desktop_sessions import (
+    scan_desktop_sessions,
+    format_session_list,
+    format_project_sessions,
+    find_group_by_name,
+    get_session_by_index,
+    find_session_title_by_id,
+    extract_recent_messages,
+)
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .utils.html_format import escape_html
@@ -306,6 +315,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("resume", self.agentic_resume),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -341,6 +351,22 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
                 pattern=r"^cd:",
+            )
+        )
+
+        # new: callbacks (for /new project picker)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._new_project_callback),
+                pattern=r"^new:",
+            )
+        )
+
+        # resume: callbacks (for /resume project drill-down & session pick)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._resume_callback),
+                pattern=r"^resume:",
             )
         )
 
@@ -403,6 +429,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("resume", "Resume a desktop Claude Code session"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -486,24 +513,338 @@ class MessageOrchestrator:
     async def agentic_new(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Reset session, one-line confirmation."""
+        """Reset session and let user pick a project directory.
+
+        /new         — show project picker (inline buttons, grouped by activity)
+        /new <name>  — reset and switch to named project directly
+        """
+        args = update.message.text.split()[1:] if update.message.text else []
+        base = self.settings.approved_directory
+
+        # Direct switch: /new <project_name>
+        if args:
+            target_name = args[0]
+            target_path = base / target_name
+            if not target_path.is_dir():
+                await update.message.reply_text(
+                    f"❌ Directory not found: <code>{escape_html(target_name)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+            self._reset_session(context, target_path)
+            await update.message.reply_text(
+                f"🔄 New session in <b>{escape_html(target_name)}</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        # No args — show project picker grouped by activity
+        try:
+            entries = [
+                d
+                for d in base.iterdir()
+                if d.is_dir() and not d.name.startswith(".")
+            ]
+        except OSError as e:
+            await update.message.reply_text(f"Error reading workspace: {e}")
+            return
+
+        # Classify projects by activity level
+        active, recent, archived = self._classify_projects(entries)
+
+        # Build message text with section headers (left-aligned)
+        text_lines = ["🔄 <b>New Session</b>\n"]
+        keyboard_rows: List[list] = []
+
+        if active:
+            text_lines.append(f"🟢 <b>活跃项目</b>（7天内）")
+            self._add_project_rows(keyboard_rows, active)
+
+        if recent:
+            text_lines.append(f"⚪ 近期项目")
+            self._add_project_rows(keyboard_rows, recent)
+
+        # Archived — collapsed
+        if archived:
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"📂 更多项目 ({len(archived)})...",
+                        callback_data="new:__archived__",
+                    )
+                ]
+            )
+
+        # Bottom row: root + new directory
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    "🏠 JoyaProjects", callback_data="new:__root__"
+                ),
+                InlineKeyboardButton(
+                    "➕ 新建目录", callback_data="new:__create__"
+                ),
+            ]
+        )
+
+        reply_markup = InlineKeyboardMarkup(keyboard_rows)
+        await update.message.reply_text(
+            "\n".join(text_lines),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    def _classify_projects(
+        self, entries: List[Path]
+    ) -> tuple:
+        """Classify projects into active/recent/archived by activity.
+
+        Activity is determined by Claude session file modification time,
+        falling back to directory modification time.
+
+        Returns (active, recent, archived) lists of (path, sort_key) tuples.
+        """
+        import time as _time
+
+        now = _time.time()
+        seven_days = 7 * 86400
+        thirty_days = 30 * 86400
+        claude_projects = Path.home() / ".claude" / "projects"
+
+        scored: List[tuple] = []
+        for entry in entries:
+            # Check Claude session activity
+            session_dir_name = (
+                f"-Users-joya-JoyaProjects-{entry.name}"
+            )
+            session_dir = claude_projects / session_dir_name
+            latest_activity = entry.stat().st_mtime  # fallback: dir mtime
+
+            if session_dir.is_dir():
+                try:
+                    jsonl_files = list(session_dir.glob("*.jsonl"))
+                    if jsonl_files:
+                        latest_session = max(
+                            f.stat().st_mtime for f in jsonl_files
+                        )
+                        latest_activity = max(latest_activity, latest_session)
+                except OSError:
+                    pass
+
+            age = now - latest_activity
+            scored.append((entry, latest_activity, age))
+
+        # Sort by most recent activity first
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        active = []
+        recent = []
+        archived = []
+        for entry, activity, age in scored:
+            if age <= seven_days:
+                active.append(entry)
+            elif age <= thirty_days:
+                recent.append(entry)
+            else:
+                archived.append(entry)
+
+        return active, recent, archived
+
+    def _add_project_rows(
+        self,
+        keyboard_rows: List[list],
+        projects: List[Path],
+    ) -> None:
+        """Add project buttons to keyboard (2 per row)."""
+        for i in range(0, len(projects), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(projects):
+                    name = projects[i + j].name
+                    row.append(
+                        InlineKeyboardButton(
+                            name,
+                            callback_data=f"new:{name}",
+                        )
+                    )
+            keyboard_rows.append(row)
+
+    def _reset_session(
+        self, context: ContextTypes.DEFAULT_TYPE, project_path: Path
+    ) -> None:
+        """Reset session state and switch to project directory."""
         context.user_data["claude_session_id"] = None
+        context.user_data["_session_title"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        context.user_data["current_directory"] = project_path
+        context.user_data.pop("_resume_groups", None)
+        context.user_data.pop("_awaiting_new_dir", None)
 
-        await update.message.reply_text("Session reset. What's next?")
+    async def _new_project_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle new: callbacks — select project for new session."""
+        query = update.callback_query
+        await query.answer()
+
+        _, action = query.data.split(":", 1)
+        base = self.settings.approved_directory
+
+        # Section header — no-op
+        if action == "__noop__":
+            return
+
+        # Show archived projects
+        if action == "__archived__":
+            try:
+                entries = [
+                    d
+                    for d in base.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                ]
+            except OSError:
+                return
+            _, _, archived = self._classify_projects(entries)
+            if not archived:
+                await query.edit_message_text("📂 没有更多项目。")
+                return
+            keyboard_rows: List[list] = []
+            self._add_project_rows(keyboard_rows, archived)
+            keyboard_rows.append(
+                [InlineKeyboardButton("← 返回", callback_data="new:__back__")]
+            )
+            await query.edit_message_text(
+                "🔄 <b>New Session</b>\n\n📂 更多项目",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            )
+            return
+
+        # Back to main project list
+        if action == "__back__":
+            # Re-render the main project picker
+            try:
+                entries = [
+                    d
+                    for d in base.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                ]
+            except OSError:
+                return
+            active, recent, archived = self._classify_projects(entries)
+
+            text_lines = ["🔄 <b>New Session</b>\n"]
+            keyboard_rows = []
+            if active:
+                text_lines.append(f"🟢 <b>活跃项目</b>（7天内）")
+                self._add_project_rows(keyboard_rows, active)
+            if recent:
+                text_lines.append(f"⚪ 近期项目")
+                self._add_project_rows(keyboard_rows, recent)
+            if archived:
+                keyboard_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"📂 更多项目 ({len(archived)})...",
+                            callback_data="new:__archived__",
+                        )
+                    ]
+                )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🏠 JoyaProjects", callback_data="new:__root__"
+                    ),
+                    InlineKeyboardButton(
+                        "➕ 新建目录", callback_data="new:__create__"
+                    ),
+                ]
+            )
+            await query.edit_message_text(
+                "\n".join(text_lines),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            )
+            return
+
+        if action == "__create__":
+            # Ask user to type the new directory name
+            context.user_data["_awaiting_new_dir"] = True
+            await query.edit_message_text(
+                "📝 请输入新目录名称（在 JoyaProjects 下创建）："
+            )
+            return
+
+        if action == "__root__":
+            project_path = base
+            project_display = "JoyaProjects"
+        else:
+            project_path = base / action
+            project_display = action
+
+        if not project_path.is_dir():
+            await query.edit_message_text(
+                f"❌ Directory not found: <code>{escape_html(action)}</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        self._reset_session(context, project_path)
+
+        # Send self-intro prompt to Claude
+        await query.edit_message_text(
+            f"🔄 New session in <b>{escape_html(project_display)}</b>...",
+            parse_mode="HTML",
+        )
+
+        # Trigger Claude self-introduction
+        await self._send_intro(update, context, query.message.chat)
+
+    async def _send_intro(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Any
+    ) -> None:
+        """Show a static intro message for the new session."""
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        project_name = Path(str(current_dir)).name if current_dir else "JoyaProjects"
+        agent_name = self.settings.claude_default_agent or "claude"
+
+        # Agent display name mapping
+        agent_display = {
+            "meta": "Alice 🎀",
+            "dev": "Salomé 💃",
+            "qa": "Rêve 🔍",
+            "corp": "Zoey 📋",
+            "creator": "Aria 🦋",
+        }.get(agent_name, agent_name)
+
+        await chat.send_message(
+            f"✅ <b>{agent_display}</b> · {escape_html(project_name)}\n"
+            f"Ready. What's next?",
+            parse_mode="HTML",
+        )
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Compact one-line status, no buttons."""
+        """Show current project, session, and cost info."""
         current_dir = context.user_data.get(
             "current_directory", self.settings.approved_directory
         )
-        dir_display = str(current_dir)
+
+        # Project name: use directory name for brevity
+        project_name = Path(str(current_dir)).name if current_dir else "unknown"
 
         session_id = context.user_data.get("claude_session_id")
-        session_status = "active" if session_id else "none"
+        session_title = context.user_data.get("_session_title")
+
+        # If no cached title, try to look it up from desktop session files
+        if session_id and not session_title:
+            session_title = find_session_title_by_id(session_id)
+            if session_title:
+                context.user_data["_session_title"] = session_title
 
         # Cost info
         cost_str = ""
@@ -513,13 +854,25 @@ class MessageOrchestrator:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
-                cost_str = f" · Cost: ${current_cost:.2f}"
+                cost_str = f"\n💰 Cost: ${current_cost:.2f}"
             except Exception:
                 pass
 
-        await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
-        )
+        # Build status message
+        lines = [f"📂 <b>{escape_html(project_name)}</b>"]
+        lines.append(f"   <code>{escape_html(str(current_dir))}</code>")
+
+        if session_id:
+            short_id = session_id[:8]
+            lines.append(f"\n🔗 Session: <code>{short_id}</code>")
+            if session_title:
+                lines.append(f"💬 \"{escape_html(session_title)}\"")
+        else:
+            lines.append("\n⚪ No active session")
+
+        lines.append(cost_str)
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -826,6 +1179,39 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
+        # If user types a plain number after viewing /resume list, treat as selection
+        resume_groups = context.user_data.get("_resume_groups")
+        if resume_groups and message_text.strip().isdigit():
+            index = int(message_text.strip())
+            session = get_session_by_index(resume_groups, index)
+            if session:
+                # Inject the index into context and call resume logic directly
+                context.user_data["_resume_selection"] = index
+                await self._do_resume_session(update, context, index)
+                return
+
+        # If waiting for new directory name input
+        if context.user_data.get("_awaiting_new_dir"):
+            context.user_data.pop("_awaiting_new_dir", None)
+            dir_name = message_text.strip()
+            if not dir_name or "/" in dir_name or dir_name.startswith("."):
+                await update.message.reply_text("❌ 无效目录名，请重新 /new")
+                return
+            base = self.settings.approved_directory
+            new_path = base / dir_name
+            try:
+                new_path.mkdir(parents=False, exist_ok=True)
+            except OSError as e:
+                await update.message.reply_text(f"❌ 创建失败: {e}")
+                return
+            self._reset_session(context, new_path)
+            await update.message.reply_text(
+                f"📁 Created <b>{escape_html(dir_name)}</b>",
+                parse_mode="HTML",
+            )
+            await self._send_intro(update, context, update.message.chat)
+            return
+
         logger.info(
             "Agentic text message",
             user_id=user_id,
@@ -894,6 +1280,11 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+
+            # Set session title from first user message if not already set
+            if not context.user_data.get("_session_title"):
+                first_line = message_text.strip().split("\n")[0][:80]
+                context.user_data["_session_title"] = first_line
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -1329,6 +1720,263 @@ class MessageOrchestrator:
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
+
+    async def agentic_resume(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Resume a desktop Claude Code session.
+
+        /resume              — compact view (recent sessions) + project buttons
+        /resume all          — full list of all sessions
+        /resume <project>    — filter sessions by project name
+        /resume <number>     — resume the session at that index
+        """
+        args = update.message.text.split()[1:] if update.message.text else []
+        await update.message.chat.send_action("typing")
+        groups = scan_desktop_sessions()
+        context.user_data["_resume_groups"] = groups
+
+        if not args:
+            # Default: compact view + project inline buttons
+            text = format_session_list(groups, compact=True)
+            keyboard = self._build_project_keyboard(groups)
+            await update.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+
+        arg = args[0]
+
+        # /resume all — full list
+        if arg.lower() == "all":
+            text = format_session_list(groups, compact=False)
+            await update.message.reply_text(text, parse_mode="HTML")
+            return
+
+        # /resume <number> — resume by index
+        try:
+            index = int(arg)
+            await self._do_resume_session(update, context, index)
+            return
+        except ValueError:
+            pass
+
+        # /resume <project_name> — filter by project
+        group = find_group_by_name(groups, arg)
+        if group:
+            text = format_project_sessions(group)
+            keyboard = self._build_session_keyboard(groups, group)
+            await update.message.reply_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ 未找到项目 \"{escape_html(arg)}\"。\n"
+                f"发送 <code>/resume</code> 查看所有项目。",
+                parse_mode="HTML",
+            )
+
+    def _build_project_keyboard(
+        self, groups: List,
+    ) -> InlineKeyboardMarkup:
+        """Build inline keyboard with project buttons for /resume."""
+        buttons = []
+        row = []
+        for group in groups[:8]:
+            name = group.project_name
+            if len(name) > 15:
+                name = name[:13] + ".."
+            icon = "🟢" if group.sessions[0].is_recent else "📂"
+            row.append(
+                InlineKeyboardButton(
+                    f"{icon} {name}",
+                    callback_data=f"resume:proj:{group.project_name}",
+                )
+            )
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        # "All sessions" button
+        buttons.append([
+            InlineKeyboardButton(
+                "📋 全部会话", callback_data="resume:all"
+            )
+        ])
+        return InlineKeyboardMarkup(buttons)
+
+    def _build_session_keyboard(
+        self, groups: List, group: "ProjectGroup",
+    ) -> InlineKeyboardMarkup:
+        """Build inline keyboard for sessions within a project."""
+        # Find global index offset for this group
+        global_idx = 1
+        for g in groups:
+            if g.project_name == group.project_name:
+                break
+            global_idx += len(g.sessions)
+
+        buttons = []
+        row = []
+        for i, session in enumerate(group.sessions):
+            status = "🟢" if session.is_recent else "⚪"
+            idx = global_idx + i
+            row.append(
+                InlineKeyboardButton(
+                    f"{status} {idx}",
+                    callback_data=f"resume:pick:{idx}",
+                )
+            )
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        buttons.append([
+            InlineKeyboardButton("← 返回", callback_data="resume:back")
+        ])
+        return InlineKeyboardMarkup(buttons)
+
+    async def _resume_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle resume: inline keyboard callbacks."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data or ""
+
+        groups = context.user_data.get("_resume_groups")
+        if not groups:
+            groups = scan_desktop_sessions()
+            context.user_data["_resume_groups"] = groups
+
+        if data == "resume:all":
+            # Show full list
+            text = format_session_list(groups, compact=False)
+            await query.edit_message_text(text, parse_mode="HTML")
+
+        elif data == "resume:back":
+            # Back to compact view with project buttons
+            text = format_session_list(groups, compact=True)
+            keyboard = self._build_project_keyboard(groups)
+            await query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=keyboard
+            )
+
+        elif data.startswith("resume:proj:"):
+            # Drill down into a project
+            project_name = data[len("resume:proj:"):]
+            group = find_group_by_name(groups, project_name)
+            if group:
+                text = format_project_sessions(group)
+                keyboard = self._build_session_keyboard(groups, group)
+                await query.edit_message_text(
+                    text, parse_mode="HTML", reply_markup=keyboard
+                )
+
+        elif data.startswith("resume:pick:"):
+            # Pick a session by global index
+            try:
+                index = int(data[len("resume:pick:"):])
+            except ValueError:
+                return
+            session = get_session_by_index(groups, index)
+            if not session:
+                await query.edit_message_text("❌ 会话不存在，请重试 /resume")
+                return
+            # Apply the session and show preview
+            result_text = await self._apply_session_resume(
+                context, session, index
+            )
+            await query.edit_message_text(result_text, parse_mode="HTML")
+
+    async def _do_resume_session(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, index: int
+    ) -> None:
+        """Resume a desktop session by its 1-based global index (text command)."""
+        groups = context.user_data.get("_resume_groups")
+        if not groups:
+            groups = scan_desktop_sessions()
+
+        session = get_session_by_index(groups, index)
+        if not session:
+            await update.message.reply_text(
+                f"❌ 编号 {index} 不存在。发送 <code>/resume</code> 查看最新列表。",
+                parse_mode="HTML",
+            )
+            return
+
+        result_text = await self._apply_session_resume(context, session, index)
+        await update.message.reply_text(result_text, parse_mode="HTML")
+
+        # Audit log
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=update.effective_user.id,
+                command="resume",
+                args=[str(index), session.session_id[:8]],
+                success=True,
+            )
+
+    async def _apply_session_resume(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        session: "DesktopSession",
+        index: int,
+    ) -> str:
+        """Apply session resume to context and return formatted result text."""
+        from pathlib import Path
+
+        project_path = Path(session.project_path)
+        if not project_path.is_dir():
+            return (
+                f"❌ 项目目录不存在: "
+                f"<code>{escape_html(session.project_path)}</code>"
+            )
+
+        context.user_data["current_directory"] = project_path
+        context.user_data["claude_session_id"] = session.session_id
+        context.user_data["_session_title"] = session.title
+        context.user_data["force_new_session"] = False
+        context.user_data.pop("_resume_groups", None)
+
+        title_display = escape_html(session.title)
+        project_display = escape_html(session.project_name)
+
+        # Extract recent messages for context preview
+        recent_msgs = extract_recent_messages(session.jsonl_path, max_pairs=3)
+        preview_lines = []
+        if recent_msgs:
+            preview_lines.append("\n📝 <b>最近对话：</b>")
+            for msg in recent_msgs:
+                icon = "👤" if msg.role == "user" else "🤖"
+                text = msg.text
+                if len(text) > 200:
+                    text = text[:200] + "…"
+                lines = escape_html(text).split("\n")[:3]
+                if len(msg.text.split("\n")) > 3:
+                    lines.append("…")
+                text_display = "\n".join(lines)
+                preview_lines.append(f"{icon} {text_display}")
+
+        preview_section = "\n".join(preview_lines) if preview_lines else ""
+
+        return (
+            f"🔗 <b>已接续桌面会话</b>\n\n"
+            f"📂 {project_display}\n"
+            f"💬 \"{title_display}\"\n"
+            f"🕐 {session.age_display}"
+            f"{preview_section}\n\n"
+            f"现在发消息即可继续这个会话。"
+        )
 
     async def agentic_repo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
