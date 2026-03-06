@@ -113,10 +113,11 @@ class ClaudeIntegration:
                 else:
                     raise
 
-            # Update session (assigns real session_id for new sessions)
+            # Update session (assigns/migrates session_id as needed)
             await self.session_manager.update_session(session, response)
 
-            # Ensure response has the session's final ID
+            # Sync: after update_session, session.session_id is the
+            # authoritative ID (may differ from the original desktop UUID).
             response.session_id = session.session_id
 
             if not response.session_id:

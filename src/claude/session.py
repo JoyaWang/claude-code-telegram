@@ -220,6 +220,8 @@ class SessionManager:
         self, session: ClaudeSession, response: ClaudeResponse
     ) -> None:
         """Update session with response data and persist."""
+        old_id = session.session_id
+
         if session.is_new_session:
             # Assign the real session ID from Claude
             if response.session_id:
@@ -237,8 +239,28 @@ class SessionManager:
                 "New session assigned Claude session ID",
                 session_id=session.session_id,
             )
+        elif (
+            response.session_id
+            and response.session_id != session.session_id
+        ):
+            # Claude returned a different session_id than what we sent
+            # (e.g. after resuming a desktop session, the CLI creates a
+            # continuation session with a new ID).  We must adopt the new
+            # ID so subsequent messages continue the right session instead
+            # of trying to resume the now-consumed desktop session UUID.
+            logger.info(
+                "Session ID changed after resume",
+                old_session_id=old_id,
+                new_session_id=response.session_id,
+            )
+            session.session_id = response.session_id
 
         session.update_usage(response)
+
+        # Clean up stale key if session_id changed
+        if old_id and old_id != session.session_id:
+            self.active_sessions.pop(old_id, None)
+            await self.storage.delete_session(old_id)
 
         # Persist to storage and track as active
         if session.session_id:
