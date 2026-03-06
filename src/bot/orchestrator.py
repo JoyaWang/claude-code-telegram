@@ -1183,7 +1183,8 @@ class MessageOrchestrator:
         resume_groups = context.user_data.get("_resume_groups")
         if resume_groups and message_text.strip().isdigit():
             index = int(message_text.strip())
-            session = get_session_by_index(resume_groups, index)
+            compact = context.user_data.get("_resume_compact", False)
+            session = get_session_by_index(resume_groups, index, compact=compact)
             if session:
                 # Inject the index into context and call resume logic directly
                 context.user_data["_resume_selection"] = index
@@ -1279,7 +1280,12 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            # Only update session_id when Claude returned a valid one.
+            # An empty string (e.g. from a failed silent retry) would clobber
+            # the previous session_id and cause every subsequent message to
+            # start yet another new session.
+            if claude_response.session_id:
+                context.user_data["claude_session_id"] = claude_response.session_id
 
             # Set session title from first user message if not already set
             if not context.user_data.get("_session_title"):
@@ -1522,7 +1528,8 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            if claude_response.session_id:
+                context.user_data["claude_session_id"] = claude_response.session_id
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1658,7 +1665,8 @@ class MessageOrchestrator:
             if force_new:
                 context.user_data["force_new_session"] = False
 
-            context.user_data["claude_session_id"] = claude_response.session_id
+            if claude_response.session_id:
+                context.user_data["claude_session_id"] = claude_response.session_id
 
             from .utils.formatting import ResponseFormatter
 
@@ -1738,6 +1746,7 @@ class MessageOrchestrator:
 
         if not args:
             # Default: compact view + project inline buttons
+            context.user_data["_resume_compact"] = True
             text = format_session_list(groups, compact=True)
             keyboard = self._build_project_keyboard(groups)
             await update.message.reply_text(
@@ -1751,6 +1760,7 @@ class MessageOrchestrator:
 
         # /resume all — full list
         if arg.lower() == "all":
+            context.user_data["_resume_compact"] = False
             text = format_session_list(groups, compact=False)
             await update.message.reply_text(text, parse_mode="HTML")
             return
@@ -1859,11 +1869,13 @@ class MessageOrchestrator:
 
         if data == "resume:all":
             # Show full list
+            context.user_data["_resume_compact"] = False
             text = format_session_list(groups, compact=False)
             await query.edit_message_text(text, parse_mode="HTML")
 
         elif data == "resume:back":
             # Back to compact view with project buttons
+            context.user_data["_resume_compact"] = True
             text = format_session_list(groups, compact=True)
             keyboard = self._build_project_keyboard(groups)
             await query.edit_message_text(
@@ -1882,12 +1894,12 @@ class MessageOrchestrator:
                 )
 
         elif data.startswith("resume:pick:"):
-            # Pick a session by global index
+            # Pick a session by global index (buttons always use full-list indices)
             try:
                 index = int(data[len("resume:pick:"):])
             except ValueError:
                 return
-            session = get_session_by_index(groups, index)
+            session = get_session_by_index(groups, index, compact=False)
             if not session:
                 await query.edit_message_text("❌ 会话不存在，请重试 /resume")
                 return
@@ -1905,7 +1917,8 @@ class MessageOrchestrator:
         if not groups:
             groups = scan_desktop_sessions()
 
-        session = get_session_by_index(groups, index)
+        compact = context.user_data.get("_resume_compact", False)
+        session = get_session_by_index(groups, index, compact=compact)
         if not session:
             await update.message.reply_text(
                 f"❌ 编号 {index} 不存在。发送 <code>/resume</code> 查看最新列表。",
