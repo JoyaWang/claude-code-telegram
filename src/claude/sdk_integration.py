@@ -230,7 +230,12 @@ class ClaudeSDKManager:
 
             # When using --agent, use append-system-prompt so agent's AGENT.md
             # identity is preserved; otherwise use system-prompt directly.
-            use_agent = bool(self.config.claude_default_agent)
+            # When resuming, never use agent preset mode (the session already
+            # has its own system prompt context).
+            use_agent = bool(
+                self.config.claude_default_agent
+                and not (session_id and continue_session)
+            )
             if use_agent:
                 system_prompt_value = {"type": "preset", "append": base_prompt}
             else:
@@ -246,8 +251,13 @@ class ClaudeSDKManager:
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
 
             # Build extra CLI args
+            # Skip --agent when resuming: the resumed session already has its
+            # agent/system-prompt context embedded.  Passing --agent on top of
+            # --resume causes "Control request timeout: initialize" for desktop
+            # sessions that were created without an agent flag.
             extra_args: Dict[str, str | None] = {}
-            if self.config.claude_default_agent:
+            is_resuming = bool(session_id and continue_session)
+            if self.config.claude_default_agent and not is_resuming:
                 extra_args["agent"] = self.config.claude_default_agent
 
             logger.info(
