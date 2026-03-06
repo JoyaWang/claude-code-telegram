@@ -337,6 +337,16 @@ def _format_compact_list(groups: List[ProjectGroup]) -> str:
     # Already sorted by group.latest_modified (newest first), take top 8
     recent_sessions = recent_sessions[:8]
 
+    # Debug: log the compact index → session mapping
+    for i, (g, s) in enumerate(recent_sessions, 1):
+        logger.debug(
+            "Compact list entry",
+            display_index=i,
+            project=g.project_name,
+            session_id=s.session_id[:8],
+            title=s.title[:40],
+        )
+
     for group, session in recent_sessions:
         status = "🟢" if session.is_recent else "⚪"
         project = _escape_html(group.project_name)
@@ -419,15 +429,42 @@ def find_group_by_name(
 
 
 def get_session_by_index(
-    groups: List[ProjectGroup], index: int
+    groups: List[ProjectGroup], index: int, *, compact: bool = False
 ) -> Optional[DesktopSession]:
-    """Get a session by its 1-based global index in the formatted list."""
+    """Get a session by its 1-based global index in the formatted list.
+
+    Args:
+        compact: If True, mirror compact view logic — only the most recent
+                 session per project, max 8 entries.
+    """
     current = 1
-    for group in groups:
-        for session in group.sessions:
-            if current == index:
-                return session
-            current += 1
+    if compact:
+        for group in groups:
+            if group.sessions:
+                if current == index:
+                    logger.debug(
+                        "Compact session lookup hit",
+                        index=index,
+                        project=group.project_name,
+                        session_id=group.sessions[0].session_id[:8],
+                    )
+                    return group.sessions[0]
+                current += 1
+                if current > 8:
+                    break
+    else:
+        for group in groups:
+            for session in group.sessions:
+                if current == index:
+                    logger.debug(
+                        "Full session lookup hit",
+                        index=index,
+                        project=group.project_name,
+                        session_id=session.session_id[:8],
+                    )
+                    return session
+                current += 1
+    logger.warning("Session lookup miss", index=index, compact=compact)
     return None
 
 
