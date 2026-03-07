@@ -1,0 +1,1 @@
+/Users/joya/JoyaProjects/joya-lib/Coding/doc-template/GEMINI.md

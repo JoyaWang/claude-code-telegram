@@ -1,0 +1,1 @@
+/Users/joya/JoyaProjects/joya-lib/Coding/doc-template/steering/LESSONS_FORMAT.md
