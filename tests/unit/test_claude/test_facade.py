@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.claude.exceptions import ClaudeSessionError
 from src.claude.facade import ClaudeIntegration
 from src.claude.session import ClaudeSession, SessionManager
 from src.config.settings import Settings
@@ -127,6 +128,39 @@ class TestForceNewSkipsAutoResume:
 
             # _find_resumable_session should NOT have been called
             spy.assert_not_called()
+
+    async def test_new_session_initialize_timeout_retries_once(
+        self, facade, session_manager
+    ):
+        """New session path should retry once on initialize timeout."""
+        project = Path("/test/project")
+        user_id = 124
+        success_response = _make_mock_response(session_id="fresh-session-id")
+
+        with patch.object(
+            facade,
+            "_find_resumable_session",
+            wraps=facade._find_resumable_session,
+        ) as find_spy:
+            with patch.object(
+                facade,
+                "_execute",
+                side_effect=[
+                    RuntimeError("Control request timeout: initialize"),
+                    success_response,
+                ],
+            ) as execute_spy:
+                response = await facade.run_command(
+                    prompt="hello",
+                    working_directory=project,
+                    user_id=user_id,
+                    session_id=None,
+                    force_new=True,
+                )
+
+        find_spy.assert_not_called()
+        assert execute_spy.call_count == 2
+        assert response.session_id == "fresh-session-id"
 
 
 class TestForceNewSurvivesFailure:
@@ -294,3 +328,86 @@ class TestEmptySessionIdWarning:
 
         # Session ID should be empty on the response
         assert not result.session_id
+
+
+class TestStrictResumeBehavior:
+    """Manual /resume should not silently fall back to a fresh session."""
+
+    async def test_strict_resume_raises_instead_of_fallback(
+        self, facade, session_manager
+    ):
+        project = Path("/test/project")
+        user_id = 777
+        desktop_session_id = "2c9b6dff-4afe-4af4-86af-c0569cfc34cf"
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=RuntimeError("Control request timeout: initialize"),
+        ) as execute_spy:
+            with pytest.raises(ClaudeSessionError, match="Failed to resume"):
+                await facade.run_command(
+                    prompt="continue",
+                    working_directory=project,
+                    user_id=user_id,
+                    session_id=desktop_session_id,
+                    strict_resume=True,
+                )
+
+        # Strict mode retries once, then surfaces the resume failure directly.
+        assert execute_spy.call_count == 2
+        session = await session_manager.storage.load_session(desktop_session_id, user_id)
+        assert session is not None
+
+    async def test_strict_resume_retries_once_then_succeeds(
+        self, facade, session_manager
+    ):
+        """Strict /resume should recover from one transient initialize timeout."""
+        project = Path("/test/project")
+        user_id = 779
+        desktop_session_id = "d7df0b8a-b9a8-45ff-8a54-541fba6417df"
+        success_response = _make_mock_response(session_id=desktop_session_id)
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=[
+                RuntimeError("Control request timeout: initialize"),
+                success_response,
+            ],
+        ) as execute_spy:
+            response = await facade.run_command(
+                prompt="continue",
+                working_directory=project,
+                user_id=user_id,
+                session_id=desktop_session_id,
+                strict_resume=True,
+            )
+
+        assert execute_spy.call_count == 2
+        assert response.session_id == desktop_session_id
+
+    async def test_non_init_resume_error_does_not_fallback(
+        self, facade, session_manager
+    ):
+        """Non-resume errors should propagate without creating a fresh session."""
+        project = Path("/test/project")
+        user_id = 778
+        desktop_session_id = "1f1d4d36-741a-4f43-bdc0-f1e96bc0a9d7"
+
+        with patch.object(
+            facade,
+            "_execute",
+            side_effect=RuntimeError("Claude returned an error response: API Error: 500"),
+        ) as execute_spy:
+            with pytest.raises(RuntimeError, match="error response"):
+                await facade.run_command(
+                    prompt="continue",
+                    working_directory=project,
+                    user_id=user_id,
+                    session_id=desktop_session_id,
+                    strict_resume=False,
+                )
+
+        # Should not retry as a fresh session for API/backend failures.
+        assert execute_spy.call_count == 1

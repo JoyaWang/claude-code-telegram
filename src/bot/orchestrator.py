@@ -679,6 +679,7 @@ class MessageOrchestrator:
         context.user_data["force_new_session"] = True
         context.user_data["current_directory"] = project_path
         context.user_data.pop("_resume_groups", None)
+        context.user_data.pop("_strict_resume_once", None)
         context.user_data.pop("_awaiting_new_dir", None)
 
     async def _new_project_callback(
@@ -1172,6 +1173,18 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    @staticmethod
+    def _parse_resume_index(text: str) -> Optional[int]:
+        """Parse a resume selection index from common numeric reply formats."""
+        match = re.fullmatch(
+            r"\s*(?:第\s*)?(\d+)\s*(?:个|号)?\s*[.。、\)）]?\s*",
+            text,
+        )
+        if not match:
+            return None
+
+        return int(match.group(1))
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1179,17 +1192,15 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
-        # If user types a plain number after viewing /resume list, treat as selection
+        # If user sends an index after /resume list, treat it as a resume selection.
         resume_groups = context.user_data.get("_resume_groups")
-        if resume_groups and message_text.strip().isdigit():
-            index = int(message_text.strip())
-            compact = context.user_data.get("_resume_compact", False)
-            session = get_session_by_index(resume_groups, index, compact=compact)
-            if session:
-                # Inject the index into context and call resume logic directly
-                context.user_data["_resume_selection"] = index
-                await self._do_resume_session(update, context, index)
-                return
+        resume_index = (
+            self._parse_resume_index(message_text) if resume_groups else None
+        )
+        if resume_groups and resume_index is not None:
+            context.user_data["_resume_selection"] = resume_index
+            await self._do_resume_session(update, context, resume_index)
+            return
 
         # If waiting for new directory name input
         if context.user_data.get("_awaiting_new_dir"):
@@ -1248,6 +1259,7 @@ class MessageOrchestrator:
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
+        strict_resume = bool(context.user_data.get("_strict_resume_once"))
 
         # --- Verbose progress tracking via stream callback ---
         tool_log: List[Dict[str, Any]] = []
@@ -1274,6 +1286,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                strict_resume=strict_resume,
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1286,6 +1299,7 @@ class MessageOrchestrator:
             # start yet another new session.
             if claude_response.session_id:
                 context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data.pop("_strict_resume_once", None)
 
             # Set session title from first user message if not already set
             if not context.user_data.get("_session_title"):
@@ -1501,6 +1515,7 @@ class MessageOrchestrator:
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
         force_new = bool(context.user_data.get("force_new_session"))
+        strict_resume = bool(context.user_data.get("_strict_resume_once"))
 
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
@@ -1523,6 +1538,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                strict_resume=strict_resume,
             )
 
             if force_new:
@@ -1530,6 +1546,7 @@ class MessageOrchestrator:
 
             if claude_response.session_id:
                 context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data.pop("_strict_resume_once", None)
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1636,6 +1653,7 @@ class MessageOrchestrator:
             # Check if /new was used — skip auto-resume for this first message.
             # Flag is only cleared after a successful run so retries keep the intent.
             force_new = bool(context.user_data.get("force_new_session"))
+            strict_resume = bool(context.user_data.get("_strict_resume_once"))
 
             verbose_level = self._get_verbose_level(context)
             tool_log: List[Dict[str, Any]] = []
@@ -1658,6 +1676,7 @@ class MessageOrchestrator:
                     session_id=session_id,
                     on_stream=on_stream,
                     force_new=force_new,
+                    strict_resume=strict_resume,
                 )
             finally:
                 heartbeat.cancel()
@@ -1667,6 +1686,7 @@ class MessageOrchestrator:
 
             if claude_response.session_id:
                 context.user_data["claude_session_id"] = claude_response.session_id
+            context.user_data.pop("_strict_resume_once", None)
 
             from .utils.formatting import ResponseFormatter
 
@@ -1959,6 +1979,7 @@ class MessageOrchestrator:
         context.user_data["claude_session_id"] = session.session_id
         context.user_data["_session_title"] = session.title
         context.user_data["force_new_session"] = False
+        context.user_data["_strict_resume_once"] = True
         context.user_data.pop("_resume_groups", None)
 
         title_display = escape_html(session.title)
@@ -2026,6 +2047,7 @@ class MessageOrchestrator:
                 if existing:
                     session_id = existing.session_id
             context.user_data["claude_session_id"] = session_id
+            context.user_data.pop("_strict_resume_once", None)
 
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""
@@ -2119,6 +2141,7 @@ class MessageOrchestrator:
             if existing:
                 session_id = existing.session_id
         context.user_data["claude_session_id"] = session_id
+        context.user_data.pop("_strict_resume_once", None)
 
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""

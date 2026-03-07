@@ -294,6 +294,91 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
         assert call.kwargs.get("reply_markup") is None
 
 
+def test_parse_resume_index_accepts_common_formats(agentic_settings, deps):
+    """Resume index parser accepts common numeric reply formats."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    assert orchestrator._parse_resume_index("1") == 1
+    assert orchestrator._parse_resume_index("1.") == 1
+    assert orchestrator._parse_resume_index("第 2 个") == 2
+    assert orchestrator._parse_resume_index("3）") == 3
+    assert orchestrator._parse_resume_index("编号1") is None
+    assert orchestrator._parse_resume_index("1 hello") is None
+
+
+async def test_agentic_text_numeric_resume_routes_to_resume_handler(
+    agentic_settings, deps
+):
+    """When /resume context exists, numeric replies should not fall through to Claude."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    orchestrator._do_resume_session = AsyncMock()
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "99."
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {
+        "_resume_groups": [object()],
+        "_resume_compact": True,
+    }
+    context.bot_data = {"claude_integration": claude_integration}
+
+    await orchestrator.agentic_text(update, context)
+
+    orchestrator._do_resume_session.assert_called_once_with(update, context, 99)
+    claude_integration.run_command.assert_not_called()
+
+
+async def test_agentic_text_passes_strict_resume_after_manual_resume(
+    agentic_settings, deps
+):
+    """After /resume selection, first follow-up must run in strict resume mode."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    mock_response = MagicMock()
+    mock_response.session_id = "resumed-session-id"
+    mock_response.content = "ok"
+    mock_response.tools_used = []
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.text = "继续"
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    progress_msg = AsyncMock()
+    progress_msg.delete = AsyncMock()
+    update.message.reply_text.return_value = progress_msg
+
+    context = MagicMock()
+    context.user_data = {
+        "current_directory": agentic_settings.approved_directory,
+        "claude_session_id": "desktop-session-id",
+        "_strict_resume_once": True,
+    }
+    context.bot_data = {
+        "settings": agentic_settings,
+        "claude_integration": claude_integration,
+        "storage": None,
+        "rate_limiter": None,
+        "audit_logger": None,
+    }
+
+    await orchestrator.agentic_text(update, context)
+
+    assert claude_integration.run_command.call_args.kwargs["strict_resume"] is True
+    assert "_strict_resume_once" not in context.user_data
+
+
 async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
     """Agentic callback handler is registered with cd: pattern filter."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)

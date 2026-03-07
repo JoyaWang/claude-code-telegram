@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -64,6 +65,30 @@ class StreamUpdate:
     content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     metadata: Optional[Dict] = None
+
+
+def _strip_empty_cli_flag(command: List[str], flag: str) -> List[str]:
+    """Remove CLI flag/value pairs where value is the empty string."""
+    sanitized: List[str] = []
+    i = 0
+    while i < len(command):
+        if (
+            command[i] == flag
+            and i + 1 < len(command)
+            and command[i + 1] == ""
+        ):
+            i += 2
+            continue
+        sanitized.append(command[i])
+        i += 1
+    return sanitized
+
+
+def _sanitize_sdk_cli_command(command: List[str]) -> List[str]:
+    """Strip SDK-emitted empty CLI args that break upstream validation."""
+    command = _strip_empty_cli_flag(command, "--system-prompt")
+    command = _strip_empty_cli_flag(command, "--setting-sources")
+    return command
 
 
 def _make_can_use_tool_callback(
@@ -132,6 +157,7 @@ class ClaudeSDKManager:
 
     # Env vars from ~/.claude/settings.json that should be synced
     _CLAUDE_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+    _SDK_CLI_PATCH_APPLIED = False
 
     def __init__(
         self,
@@ -141,6 +167,7 @@ class ClaudeSDKManager:
         """Initialize SDK manager with configuration."""
         self.config = config
         self.security_validator = security_validator
+        self._patch_sdk_empty_cli_args()
 
         # Set up environment for Claude Code SDK
         # Priority: .env ANTHROPIC_API_KEY > ~/.claude/settings.json env section
@@ -150,6 +177,39 @@ class ClaudeSDKManager:
         else:
             # Sync env vars from ~/.claude/settings.json (cc-switch compatible)
             self._sync_claude_settings_env()
+
+    @classmethod
+    def _patch_sdk_empty_cli_args(cls) -> None:
+        """Patch SDK CLI command builder to avoid empty-string flags.
+
+        claude-agent-sdk 0.1.44 renders None as:
+          --system-prompt ""
+          --setting-sources ""
+        which can trigger upstream "invalid claude code request" on resume.
+        """
+        if cls._SDK_CLI_PATCH_APPLIED:
+            return
+
+        try:
+            from claude_agent_sdk._internal.transport.subprocess_cli import (
+                SubprocessCLITransport,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to import SDK subprocess transport for CLI patch",
+                error=str(e),
+            )
+            return
+
+        original_build_command = SubprocessCLITransport._build_command
+
+        def _patched_build_command(self: Any) -> List[str]:
+            command = original_build_command(self)
+            return _sanitize_sdk_cli_command(command)
+
+        SubprocessCLITransport._build_command = _patched_build_command  # type: ignore[assignment]
+        cls._SDK_CLI_PATCH_APPLIED = True
+        logger.info("Applied SDK CLI empty-argument patch")
 
     @classmethod
     def _sync_claude_settings_env(cls) -> None:
@@ -208,6 +268,12 @@ class ClaudeSDKManager:
         )
 
         try:
+            # Resume requests can hang for many minutes on upstream/API issues.
+            # Cap the effective timeout so Telegram users don't wait excessively.
+            timeout_seconds = self.config.claude_timeout_seconds
+            if continue_session:
+                timeout_seconds = min(timeout_seconds, 180)
+
             # Capture stderr from Claude CLI for better error diagnostics
             stderr_lines: List[str] = []
 
@@ -228,14 +294,12 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
-            # When using --agent, use append-system-prompt so agent's AGENT.md
-            # identity is preserved; otherwise use system-prompt directly.
-            # When resuming, never use agent preset mode (the session already
-            # has its own system prompt context).
-            use_agent = bool(
-                self.config.claude_default_agent
-                and not (session_id and continue_session)
-            )
+            is_resuming = bool(session_id and continue_session)
+
+            # Resume flows are unstable with empty CLI values
+            # (--system-prompt "" / --setting-sources ""). Prefer explicit
+            # prompt and setting sources for deterministic initialization.
+            use_agent = bool(self.config.claude_default_agent and not is_resuming)
             if use_agent:
                 system_prompt_value = {"type": "preset", "append": base_prompt}
             else:
@@ -256,15 +320,18 @@ class ClaudeSDKManager:
             # --resume causes "Control request timeout: initialize" for desktop
             # sessions that were created without an agent flag.
             extra_args: Dict[str, str | None] = {}
-            is_resuming = bool(session_id and continue_session)
             if self.config.claude_default_agent and not is_resuming:
                 extra_args["agent"] = self.config.claude_default_agent
+
+            # Keep setting sources explicit for both new and resumed sessions.
+            setting_sources = ["user", "project"]
 
             logger.info(
                 "SDK options",
                 extra_args=extra_args,
                 system_prompt_type=type(system_prompt_value).__name__,
                 default_agent=self.config.claude_default_agent,
+                setting_sources=setting_sources,
             )
 
             # Build Claude Agent options
@@ -281,7 +348,7 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=system_prompt_value,
-                setting_sources=["user", "project"],
+                setting_sources=setting_sources,
                 stderr=_stderr_callback,
                 extra_args=extra_args,
             )
@@ -363,7 +430,7 @@ class ClaudeSDKManager:
             # Execute with timeout
             await asyncio.wait_for(
                 _run_client(),
-                timeout=self.config.claude_timeout_seconds,
+                timeout=timeout_seconds,
             )
 
             # Extract cost, tools, and session_id from result message
@@ -371,11 +438,15 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            result_is_error = False
+            result_error_type = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    result_is_error = bool(getattr(message, "is_error", False))
+                    result_error_type = getattr(message, "subtype", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -436,6 +507,27 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
 
+            # Some Claude backends return transport/API failures as plain text in
+            # ResultMessage.result while is_error stays false. Treat these as
+            # execution failures so callers can retry instead of displaying them
+            # as a normal assistant reply.
+            content_text = content.strip() if isinstance(content, str) else str(content)
+            looks_like_api_error = bool(
+                re.match(r"^(API Error|Error):", content_text, flags=re.IGNORECASE)
+            ) and '"type":"error"' in content_text
+            if result_is_error or looks_like_api_error:
+                detail = content_text[:320]
+                logger.error(
+                    "Claude returned error result",
+                    session_id=final_session_id or session_id,
+                    error_type=result_error_type,
+                    is_error=result_is_error,
+                    detail=detail,
+                )
+                raise ClaudeProcessError(
+                    f"Claude returned an error response: {detail}"
+                )
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
@@ -448,16 +540,18 @@ class ClaudeSDKManager:
                         if isinstance(m, (UserMessage, AssistantMessage))
                     ]
                 ),
+                is_error=result_is_error,
+                error_type=result_error_type,
                 tools_used=tools_used,
             )
 
         except asyncio.TimeoutError:
             logger.error(
                 "Claude SDK command timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
             raise ClaudeTimeoutError(
-                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
+                f"Claude SDK timed out after {timeout_seconds}s"
             )
 
         except CLINotFoundError as e:
@@ -504,6 +598,10 @@ class ClaudeSDKManager:
         except ClaudeSDKError as e:
             logger.error("Claude SDK error", error=str(e))
             raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
+
+        except ClaudeProcessError:
+            # Preserve already-classified process errors without double wrapping.
+            raise
 
         except Exception as e:
             exceptions = getattr(e, "exceptions", None)

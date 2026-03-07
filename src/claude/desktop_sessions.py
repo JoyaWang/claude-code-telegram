@@ -102,9 +102,9 @@ class ProjectGroup:
 def _extract_session_metadata(jsonl_path: str, max_lines: int = 80) -> Dict:
     """Extract cwd and first user message from a session .jsonl file.
 
-    Returns dict with keys: 'cwd', 'title'
+    Returns dict with keys: 'cwd', 'title', 'has_messages'
     """
-    result = {"cwd": None, "title": "(无标题)"}
+    result = {"cwd": None, "title": "(无标题)", "has_messages": False}
 
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -116,6 +116,10 @@ def _extract_session_metadata(jsonl_path: str, max_lines: int = 80) -> Dict:
                     data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                msg_type = data.get("type")
+                if msg_type in {"user", "assistant"}:
+                    result["has_messages"] = True
 
                 # Extract cwd from any message that has it
                 if result["cwd"] is None and "cwd" in data:
@@ -250,41 +254,49 @@ def scan_desktop_sessions(
         # Limit sessions per project
         jsonl_files = jsonl_files[:max_sessions_per_project]
 
-        # Determine project name and path from the most recent session's cwd
+        # Extract metadata first, then derive one stable project path for all
+        # sessions in this directory. This avoids wrong fallback paths when the
+        # newest session is missing cwd but older sessions still have it.
+        session_entries = []
         project_path = None
         project_name = None
-
-        sessions = []
         for full_path, fname, size in jsonl_files:
-            session_id = fname.replace(".jsonl", "")
+            metadata = _extract_session_metadata(full_path)
+            if not metadata["has_messages"]:
+                logger.debug(
+                    "Skipping session without user/assistant messages",
+                    session_file=full_path,
+                )
+                continue
             mtime = datetime.fromtimestamp(
                 os.path.getmtime(full_path), tz=timezone.utc
             )
-            metadata = _extract_session_metadata(full_path)
+            session_entries.append((full_path, fname, size, mtime, metadata))
 
-            # Use cwd from most recent session for the project group
             if project_path is None and metadata["cwd"]:
                 project_path = metadata["cwd"]
                 project_name = _cwd_to_project_name(project_path)
 
+        # Fallback only when all sessions are missing cwd metadata.
+        if project_path is None:
+            project_path = _dir_name_to_fallback_path(dir_name)
+            project_name = dir_name
+
+        sessions = []
+        for full_path, fname, size, mtime, metadata in session_entries:
+            session_id = fname.replace(".jsonl", "")
             sessions.append(
                 DesktopSession(
                     session_id=session_id,
                     project_dir=dir_name,
                     project_name=project_name or dir_name,
-                    project_path=project_path
-                    or _dir_name_to_fallback_path(dir_name),
+                    project_path=project_path,
                     title=metadata["title"],
                     modified_at=mtime,
                     file_size=size,
                     jsonl_path=full_path,
                 )
             )
-
-        # Fallback if no cwd found in any session
-        if project_path is None:
-            project_path = _dir_name_to_fallback_path(dir_name)
-            project_name = dir_name
 
         if sessions:
             group = ProjectGroup(

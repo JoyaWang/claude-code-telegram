@@ -20,6 +20,8 @@ from src.claude.sdk_integration import (
     ClaudeResponse,
     ClaudeSDKManager,
     StreamUpdate,
+    _sanitize_sdk_cli_command,
+    _strip_empty_cli_flag,
     _make_can_use_tool_callback,
 )
 from src.config.settings import Settings
@@ -214,6 +216,29 @@ class TestClaudeSDKManager:
 
         assert response.content == "Extracted from messages"
 
+    async def test_execute_command_raises_on_api_error_payload(self, sdk_manager):
+        """API error payloads in result text should be treated as failures."""
+        from src.claude.exceptions import ClaudeProcessError
+
+        mock_factory = _mock_client_factory(
+            _make_result_message(
+                result=(
+                    'API Error: 500 {"error":{"type":"new_api_error",'
+                    '"message":"invalid claude code request"},"type":"error"}'
+                ),
+                is_error=False,
+            ),
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            with pytest.raises(ClaudeProcessError, match="error response"):
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""
         stream_updates = []
@@ -345,6 +370,8 @@ class TestClaudeSDKManager:
 
         assert len(captured_options) == 1
         assert captured_options[0].resume == "existing-session-id"
+        assert str(Path("/test")) in captured_options[0].system_prompt
+        assert captured_options[0].setting_sources == ["user", "project"]
 
     async def test_execute_command_passes_max_budget_usd(self, sdk_manager, config):
         """Test that max_budget_usd is passed from config to ClaudeAgentOptions."""
@@ -389,6 +416,96 @@ class TestClaudeSDKManager:
         assert (
             not hasattr(captured_options[0], "resume") or not captured_options[0].resume
         )
+
+
+class TestSDKCLICommandSanitization:
+    """Test SDK CLI command argument sanitization helpers."""
+
+    def test_strip_empty_cli_flag(self):
+        command = [
+            "claude",
+            "--system-prompt",
+            "",
+            "--resume",
+            "abc",
+            "--setting-sources",
+            "user,project",
+        ]
+
+        stripped = _strip_empty_cli_flag(command, "--system-prompt")
+        assert stripped == [
+            "claude",
+            "--resume",
+            "abc",
+            "--setting-sources",
+            "user,project",
+        ]
+
+    def test_sanitize_sdk_cli_command_removes_empty_pairs_only(self):
+        command = [
+            "claude",
+            "--system-prompt",
+            "",
+            "--resume",
+            "abc",
+            "--setting-sources",
+            "",
+            "--input-format",
+            "stream-json",
+        ]
+
+        sanitized = _sanitize_sdk_cli_command(command)
+        assert sanitized == [
+            "claude",
+            "--resume",
+            "abc",
+            "--input-format",
+            "stream-json",
+        ]
+
+    def test_sanitize_sdk_cli_command_keeps_non_empty_values(self):
+        command = [
+            "claude",
+            "--system-prompt",
+            "Keep me",
+            "--setting-sources",
+            "user,project",
+            "--resume",
+            "abc",
+        ]
+
+        sanitized = _sanitize_sdk_cli_command(command)
+        assert sanitized == command
+
+    def test_patch_sdk_empty_cli_args_wraps_build_command(self):
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport,
+        )
+
+        original = SubprocessCLITransport._build_command
+        original_flag = ClaudeSDKManager._SDK_CLI_PATCH_APPLIED
+
+        def fake_build_command(_self):
+            return [
+                "claude",
+                "--system-prompt",
+                "",
+                "--setting-sources",
+                "",
+                "--resume",
+                "abc",
+            ]
+
+        try:
+            SubprocessCLITransport._build_command = fake_build_command
+            ClaudeSDKManager._SDK_CLI_PATCH_APPLIED = False
+
+            ClaudeSDKManager._patch_sdk_empty_cli_args()
+            sanitized = SubprocessCLITransport._build_command(object())
+            assert sanitized == ["claude", "--resume", "abc"]
+        finally:
+            SubprocessCLITransport._build_command = original
+            ClaudeSDKManager._SDK_CLI_PATCH_APPLIED = original_flag
 
 
 class TestClaudeSandboxSettings:
@@ -458,6 +575,7 @@ class TestClaudeSandboxSettings:
         opts = captured_options[0]
         assert str(tmp_path) in opts.system_prompt
         assert "relative paths" in opts.system_prompt.lower()
+        assert opts.setting_sources == ["user", "project"]
 
     async def test_disallowed_tools_passed_to_options(self, tmp_path):
         """Test that disallowed_tools from config are passed to ClaudeAgentOptions."""

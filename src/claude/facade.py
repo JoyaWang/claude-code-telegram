@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .exceptions import ClaudeSessionError
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -37,6 +38,7 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
         force_new: bool = False,
+        strict_resume: bool = False,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -87,29 +89,78 @@ class ClaudeIntegration:
                     stream_callback=on_stream,
                 )
             except Exception as resume_error:
+                # Claude initialize can fail transiently for both resumed and
+                # brand-new sessions. Retry once with the same parameters.
+                if self._is_resume_initialization_error(resume_error):
+                    logger.warning(
+                        "Initialize attempt failed, retrying once",
+                        failed_session_id=claude_session_id,
+                        error=str(resume_error),
+                        continue_session=should_continue,
+                    )
+                    try:
+                        response = await self._execute(
+                            prompt=prompt,
+                            working_directory=working_directory,
+                            session_id=claude_session_id,
+                            continue_session=should_continue,
+                            stream_callback=on_stream,
+                        )
+                        resume_error = None
+                    except Exception as retry_error:
+                        resume_error = retry_error
+
+                if resume_error is None:
+                    pass
                 # If resume failed (e.g., session expired/missing on Claude's side),
                 # retry as a fresh session.  The CLI returns a generic exit-code-1
                 # when the session is gone, so we catch *any* error during resume.
-                if should_continue:
-                    logger.warning(
-                        "Session resume failed, starting fresh session",
-                        failed_session_id=claude_session_id,
-                        error=str(resume_error),
-                    )
-                    # Clean up the stale session
-                    await self.session_manager.remove_session(session.session_id)
+                elif should_continue:
+                    if strict_resume:
+                        # Only wrap true resume-initialization failures.
+                        # API/backend errors should surface as-is to avoid
+                        # misleading "resume failed" messaging.
+                        if self._is_resume_initialization_error(resume_error):
+                            detail = str(resume_error)
+                            if len(detail) > 240:
+                                detail = detail[:240] + "..."
+                            logger.warning(
+                                "Session resume failed in strict mode",
+                                failed_session_id=claude_session_id,
+                                error=str(resume_error),
+                            )
+                            raise ClaudeSessionError(
+                                "Failed to resume the selected session. "
+                                "Please run /resume again or use /new to start a fresh "
+                                f"session. Details: {detail}"
+                            ) from resume_error
+                        raise
 
-                    # Create a fresh session and retry
-                    session = await self.session_manager.get_or_create_session(
-                        user_id, working_directory
-                    )
-                    response = await self._execute(
-                        prompt=prompt,
-                        working_directory=working_directory,
-                        session_id=None,
-                        continue_session=False,
-                        stream_callback=on_stream,
-                    )
+                    # Only fall back to a fresh session for resume-specific
+                    # initialization failures. Other errors (e.g. upstream API
+                    # 500) should bubble up so callers can retry the same session.
+                    if self._is_resume_initialization_error(resume_error):
+                        logger.warning(
+                            "Session resume failed, starting fresh session",
+                            failed_session_id=claude_session_id,
+                            error=str(resume_error),
+                        )
+                        # Clean up the stale session
+                        await self.session_manager.remove_session(session.session_id)
+
+                        # Create a fresh session and retry
+                        session = await self.session_manager.get_or_create_session(
+                            user_id, working_directory
+                        )
+                        response = await self._execute(
+                            prompt=prompt,
+                            working_directory=working_directory,
+                            session_id=None,
+                            continue_session=False,
+                            stream_callback=on_stream,
+                        )
+                    else:
+                        raise
                 else:
                     raise
 
@@ -161,6 +212,15 @@ class ClaudeIntegration:
             session_id=session_id,
             continue_session=continue_session,
             stream_callback=stream_callback,
+        )
+
+    @staticmethod
+    def _is_resume_initialization_error(error: Exception) -> bool:
+        """Return True for errors that indicate a broken/expired resume target."""
+        text = str(error).lower()
+        return (
+            "control request timeout: initialize" in text
+            or "command failed with exit code 1" in text
         )
 
     async def _find_resumable_session(
