@@ -8,6 +8,7 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -17,6 +18,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    Message,
+    PhotoSize,
     Update,
 )
 from telegram.ext import (
@@ -123,6 +126,8 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        self._photo_group_buffer_seconds = 1.2
+        self._pending_photo_groups: Dict[str, Dict[str, Any]] = {}
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -1618,40 +1623,160 @@ class MessageOrchestrator:
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Process photo -> Claude, minimal chrome."""
+        """Process photo(s) -> Claude, with media-group aggregation support."""
+        if not update.message or not update.message.photo:
+            return
+
+        media_group_id = update.message.media_group_id
+        if media_group_id:
+            await self._enqueue_photo_group(update, context, media_group_id)
+            return
+
+        await self._process_photo_batch(
+            update=update,
+            context=context,
+            photos=[update.message.photo[-1]],
+            caption=update.message.caption,
+        )
+
+    async def _enqueue_photo_group(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        media_group_id: str,
+    ) -> None:
+        """Buffer Telegram media-group photos and process them as one request."""
+        if not update.message or not update.effective_chat or not update.effective_user:
+            return
+
+        key = f"{update.effective_chat.id}:{update.effective_user.id}:{media_group_id}"
+        state = self._pending_photo_groups.get(key)
+        photo = update.message.photo[-1]
+
+        if state is None:
+            progress_msg = await update.message.reply_text("📷 已收到多图，正在合并分析…")
+            state = {
+                "update": update,
+                "context": context,
+                "photos": [photo],
+                "caption": update.message.caption,
+                "progress_msg": progress_msg,
+                "task": None,
+            }
+            self._pending_photo_groups[key] = state
+        else:
+            state["photos"].append(photo)
+            if not state.get("caption") and update.message.caption:
+                state["caption"] = update.message.caption
+
+        prev_task = state.get("task")
+        if prev_task:
+            prev_task.cancel()
+        state["task"] = asyncio.create_task(self._flush_photo_group(key))
+
+    async def _flush_photo_group(self, key: str) -> None:
+        """Wait for media-group completion, then run one combined analysis."""
+        try:
+            await asyncio.sleep(self._photo_group_buffer_seconds)
+        except asyncio.CancelledError:
+            return
+
+        state = self._pending_photo_groups.pop(key, None)
+        if not state:
+            return
+
+        update: Update = state["update"]
+        context: ContextTypes.DEFAULT_TYPE = state["context"]
+        progress_msg: Message = state["progress_msg"]
+        photos: List[PhotoSize] = state["photos"]
+        caption: Optional[str] = state.get("caption")
+
+        await self._process_photo_batch(
+            update=update,
+            context=context,
+            photos=photos,
+            caption=caption,
+            progress_msg=progress_msg,
+        )
+
+    def _build_photo_prompt(self, image_paths: List[Path], caption: Optional[str]) -> str:
+        """Build a prompt that references uploaded image file paths."""
+        count = len(image_paths)
+        header = f"我上传了{count}张图片，请基于图片内容回答问题。"
+        if caption:
+            header += f"\n用户补充说明：{caption}"
+
+        refs = "\n".join(
+            f"- 图片{i + 1}: @{path}" for i, path in enumerate(image_paths)
+        )
+        if count > 1:
+            tail = "\n\n请综合比较这些图片后再回答。"
+        else:
+            tail = "\n\n请直接根据图片内容回答。"
+        return f"{header}\n\n图片文件：\n{refs}{tail}"
+
+    async def _download_photos_for_prompt(
+        self,
+        photos: List[PhotoSize],
+        working_directory: Path,
+    ) -> List[Path]:
+        """Download Telegram photos to working dir and return local file paths."""
+        upload_dir = (working_directory / ".telegram_uploads").resolve()
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: List[Path] = []
+        for idx, photo in enumerate(photos):
+            tg_file = await photo.get_file()
+            remote_path = getattr(tg_file, "file_path", "") or ""
+            suffix = Path(remote_path).suffix.lower() if remote_path else ""
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                suffix = ".jpg"
+            local_path = upload_dir / f"photo_{int(time.time() * 1000)}_{idx}_{uuid.uuid4().hex[:8]}{suffix}"
+            await tg_file.download_to_drive(str(local_path))
+            downloaded.append(local_path)
+        return downloaded
+
+    async def _process_photo_batch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        photos: List[PhotoSize],
+        caption: Optional[str] = None,
+        progress_msg: Optional[Message] = None,
+    ) -> None:
+        """Run Claude analysis for one or many uploaded photos."""
+        if not update.message:
+            return
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
         image_handler = features.get_image_handler() if features else None
-
         if not image_handler:
             await update.message.reply_text("Photo processing is not available.")
             return
 
         chat = update.message.chat
         await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Working...")
+        progress = progress_msg or await update.message.reply_text("Working...")
 
+        local_images: List[Path] = []
         try:
-            photo = update.message.photo[-1]
-            processed_image = await image_handler.process_image(
-                photo, update.message.caption
-            )
-
             claude_integration = context.bot_data.get("claude_integration")
             if not claude_integration:
-                await progress_msg.edit_text(
+                await progress.edit_text(
                     "Claude integration not available. Check configuration."
                 )
                 return
 
-            current_dir = context.user_data.get(
-                "current_directory", self.settings.approved_directory
+            current_dir = Path(
+                context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                )
             )
-            session_id = context.user_data.get("claude_session_id")
+            local_images = await self._download_photos_for_prompt(photos, current_dir)
+            prompt = self._build_photo_prompt(local_images, caption)
 
-            # Check if /new was used — skip auto-resume for this first message.
-            # Flag is only cleared after a successful run so retries keep the intent.
+            session_id = context.user_data.get("claude_session_id")
             force_new = bool(context.user_data.get("force_new_session"))
             strict_resume = bool(context.user_data.get("_strict_resume_once"))
 
@@ -1660,7 +1785,7 @@ class MessageOrchestrator:
             mcp_images_photo: List[ImageAttachment] = []
             on_stream = self._make_stream_callback(
                 verbose_level,
-                progress_msg,
+                progress,
                 tool_log,
                 time.time(),
                 mcp_images=mcp_images_photo,
@@ -1670,7 +1795,7 @@ class MessageOrchestrator:
             heartbeat = self._start_typing_heartbeat(chat)
             try:
                 claude_response = await claude_integration.run_command(
-                    prompt=processed_image.prompt,
+                    prompt=prompt,
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
@@ -1683,7 +1808,6 @@ class MessageOrchestrator:
 
             if force_new:
                 context.user_data["force_new_session"] = False
-
             if claude_response.session_id:
                 context.user_data["claude_session_id"] = claude_response.session_id
             context.user_data.pop("_strict_resume_once", None)
@@ -1696,13 +1820,11 @@ class MessageOrchestrator:
             )
 
             try:
-                await progress_msg.delete()
+                await progress.delete()
             except Exception:
                 logger.debug("Failed to delete progress message, ignoring")
 
-            # Use MCP-collected images (from send_image_to_user tool calls)
             images: List[ImageAttachment] = mcp_images_photo
-
             caption_sent = False
             if images and len(formatted_messages) == 1:
                 msg = formatted_messages[0]
@@ -1744,10 +1866,22 @@ class MessageOrchestrator:
         except Exception as e:
             from .handlers.message import _format_error_message
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            try:
+                await progress.edit_text(_format_error_message(e), parse_mode="HTML")
+            except Exception:
+                pass
             logger.error(
-                "Claude photo processing failed", error=str(e), user_id=user_id
+                "Claude photo processing failed",
+                error=str(e),
+                user_id=user_id,
+                photo_count=len(photos),
             )
+        finally:
+            for path in local_images:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    logger.debug("Failed to cleanup temp photo", path=str(path))
 
     async def agentic_resume(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

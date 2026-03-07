@@ -861,3 +861,29 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+def test_build_photo_prompt_single_image(agentic_settings, deps):
+    """Single image prompt should include one @path reference."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    prompt = orchestrator._build_photo_prompt(
+        [Path("/tmp/a.png")],
+        "请看这张图",
+    )
+    assert "@/tmp/a.png" in prompt
+    assert "上传了1张图片" in prompt
+    assert "请综合比较" not in prompt
+
+
+def test_build_photo_prompt_multiple_images(agentic_settings, deps):
+    """Multi-image prompt should include all @path references and compare hint."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    prompt = orchestrator._build_photo_prompt(
+        [Path("/tmp/a.png"), Path("/tmp/b.jpg"), Path("/tmp/c.webp")],
+        None,
+    )
+    assert "@/tmp/a.png" in prompt
+    assert "@/tmp/b.jpg" in prompt
+    assert "@/tmp/c.webp" in prompt
+    assert "上传了3张图片" in prompt
+    assert "请综合比较这些图片后再回答" in prompt
