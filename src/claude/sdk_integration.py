@@ -281,7 +281,11 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=system_prompt_value,
-                setting_sources=["user", "project"],
+                # Explicitly passing the "user" source causes Claude CLI
+                # initialization to hang in SDK mode on this environment.
+                # Keep project-scoped settings/skills, but let the CLI load
+                # user settings implicitly via its default behavior.
+                setting_sources=["project"],
                 stderr=_stderr_callback,
                 extra_args=extra_args,
             )

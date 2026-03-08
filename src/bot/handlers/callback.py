@@ -12,6 +12,7 @@ from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ..utils.html_format import escape_html
+from ..utils.session_state import reset_claude_session_state
 
 logger = structlog.get_logger()
 
@@ -421,9 +422,10 @@ async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     """Handle new session action."""
     settings: Settings = context.bot_data["settings"]
 
-    # Clear session
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = True
+    reset_claude_session_state(
+        context.user_data,
+        session_started=True,
+    )
 
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
@@ -492,10 +494,11 @@ async def _handle_end_session_action(query, context: ContextTypes.DEFAULT_TYPE) 
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = False
-    context.user_data["last_message"] = None
+    reset_claude_session_state(
+        context.user_data,
+        session_started=False,
+        clear_last_message=True,
+    )
 
     # Create quick action buttons
     keyboard = [
@@ -1031,9 +1034,10 @@ async def handle_conversation_callback(
         if conversation_enhancer:
             conversation_enhancer.clear_context(user_id)
 
-        # Clear session data
-        context.user_data["claude_session_id"] = None
-        context.user_data["session_started"] = False
+        reset_claude_session_state(
+            context.user_data,
+            session_started=False,
+        )
 
         current_dir = context.user_data.get(
             "current_directory", settings.approved_directory

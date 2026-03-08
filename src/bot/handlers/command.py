@@ -13,6 +13,7 @@ from ...projects import PrivateTopicsUnavailableError, load_project_registry
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 from ..utils.html_format import escape_html
+from ..utils.session_state import reset_claude_session_state
 
 logger = structlog.get_logger()
 
@@ -314,10 +315,11 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Track what was cleared for user feedback
     old_session_id = context.user_data.get("claude_session_id")
 
-    # Clear existing session data - this is the explicit way to reset context
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = True
-    context.user_data["force_new_session"] = True
+    # Explicit resets must block the next message from auto-resuming.
+    reset_claude_session_state(
+        context.user_data,
+        session_started=True,
+    )
 
     cleared_info = ""
     if old_session_id:
@@ -1031,10 +1033,11 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     relative_path = current_dir.relative_to(settings.approved_directory)
 
-    # Clear session data
-    context.user_data["claude_session_id"] = None
-    context.user_data["session_started"] = False
-    context.user_data["last_message"] = None
+    reset_claude_session_state(
+        context.user_data,
+        session_started=False,
+        clear_last_message=True,
+    )
 
     # Create quick action buttons
     keyboard = [
