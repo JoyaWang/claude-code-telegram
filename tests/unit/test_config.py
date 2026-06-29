@@ -107,6 +107,12 @@ def test_admin_quality_settings_defaults_and_overrides():
         assert defaults.admin_quality_webhook_url is None
         assert defaults.admin_quality_secret_str is None
         assert defaults.admin_quality_timeout_seconds == 15
+        assert defaults.admin_quality_api_url is None
+        assert defaults.admin_quality_api_key_str is None
+        assert defaults.admin_quality_outbox_enabled is False
+        assert defaults.admin_quality_outbox_runner_id == "telegram-bot:local"
+        assert defaults.admin_quality_outbox_poll_interval_seconds == 10
+        assert defaults.admin_quality_outbox_limit == 10
 
         overridden = Settings(
             telegram_bot_token="test_token",
@@ -115,6 +121,13 @@ def test_admin_quality_settings_defaults_and_overrides():
             admin_quality_webhook_url="http://admin.local/api/quality/telegram-webhook",
             admin_quality_webhook_secret="secret",
             admin_quality_timeout_seconds=30,
+            admin_quality_api_url="http://admin.local/api/quality",
+            admin_quality_api_key="runner-token",
+            admin_quality_outbox_enabled=True,
+            admin_quality_outbox_project_key="laicai",
+            admin_quality_outbox_runtime_env="prod",
+            admin_quality_outbox_poll_interval_seconds=5,
+            admin_quality_outbox_limit=3,
             _env_file=None,
         )
         assert (
@@ -123,6 +136,13 @@ def test_admin_quality_settings_defaults_and_overrides():
         )
         assert overridden.admin_quality_secret_str == "secret"
         assert overridden.admin_quality_timeout_seconds == 30
+        assert overridden.admin_quality_api_url == "http://admin.local/api/quality"
+        assert overridden.admin_quality_api_key_str == "runner-token"
+        assert overridden.admin_quality_outbox_enabled is True
+        assert overridden.admin_quality_outbox_project_key == "laicai"
+        assert overridden.admin_quality_outbox_runtime_env == "prod"
+        assert overridden.admin_quality_outbox_poll_interval_seconds == 5
+        assert overridden.admin_quality_outbox_limit == 3
 
 
 def test_approved_directory_validation_nonexistent():

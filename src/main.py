@@ -23,6 +23,10 @@ from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
+from src.integrations.admin_quality_outbox import (
+    AdminQualityApiClient,
+    AdminQualityOutboxRelay,
+)
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
@@ -215,6 +219,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     event_bus: EventBus = app["event_bus"]
 
     notification_service: Optional[NotificationService] = None
+    admin_quality_outbox_relay: Optional[AdminQualityOutboxRelay] = None
     scheduler: Optional[JobScheduler] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
 
@@ -289,6 +294,28 @@ async def run_application(app: Dict[str, Any]) -> None:
         notification_service.register()
         await notification_service.start()
 
+        if config.admin_quality_outbox_enabled:
+            admin_quality_client = AdminQualityApiClient(
+                api_url=config.admin_quality_api_url,
+                api_key=config.admin_quality_api_key_str,
+                timeout_seconds=config.admin_quality_timeout_seconds,
+            )
+            admin_quality_outbox_relay = AdminQualityOutboxRelay(
+                bot=telegram_bot,
+                client=admin_quality_client,
+                default_chat_ids=(
+                    config.notification_chat_ids or config.allowed_users or []
+                ),
+                runner_id=config.admin_quality_outbox_runner_id,
+                project_key=config.admin_quality_outbox_project_key,
+                runtime_env=config.admin_quality_outbox_runtime_env,
+                poll_interval_seconds=(
+                    config.admin_quality_outbox_poll_interval_seconds
+                ),
+                limit=config.admin_quality_outbox_limit,
+            )
+            await admin_quality_outbox_relay.start()
+
         # Collect concurrent tasks
         tasks = []
 
@@ -354,6 +381,8 @@ async def run_application(app: Dict[str, Any]) -> None:
         try:
             if scheduler:
                 await scheduler.stop()
+            if admin_quality_outbox_relay:
+                await admin_quality_outbox_relay.stop()
             if notification_service:
                 await notification_service.stop()
             await event_bus.stop()

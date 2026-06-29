@@ -240,6 +240,42 @@ class Settings(BaseSettings):
         ge=1,
         le=120,
     )
+    admin_quality_api_url: Optional[str] = Field(
+        None,
+        description="Admin Platform quality API URL for bot-gateway outbox polling",
+    )
+    admin_quality_api_key: Optional[SecretStr] = Field(
+        None,
+        description="API key for admin-platform quality runner actions",
+    )
+    admin_quality_outbox_enabled: bool = Field(
+        False,
+        description="Enable polling admin-platform Telegram notification outbox",
+    )
+    admin_quality_outbox_project_key: Optional[str] = Field(
+        None,
+        description="Optional project filter for admin quality notification outbox",
+    )
+    admin_quality_outbox_runtime_env: Optional[Literal["dev", "prod"]] = Field(
+        None,
+        description="Optional runtime env filter for admin quality notification outbox",
+    )
+    admin_quality_outbox_runner_id: str = Field(
+        "telegram-bot:local",
+        description="Runner id recorded when claiming notification deliveries",
+    )
+    admin_quality_outbox_poll_interval_seconds: float = Field(
+        10.0,
+        description="Polling interval for admin quality notification outbox",
+        ge=1.0,
+        le=300.0,
+    )
+    admin_quality_outbox_limit: int = Field(
+        10,
+        description="Max notification deliveries claimed per outbox poll",
+        ge=1,
+        le=25,
+    )
     enable_project_threads: bool = Field(
         False,
         description="Enable strict routing by Telegram forum project threads",
@@ -450,6 +486,13 @@ class Settings(BaseSettings):
         """Get admin quality webhook secret as string."""
         if self.admin_quality_webhook_secret:
             return self.admin_quality_webhook_secret.get_secret_value()
+        return None
+
+    @property
+    def admin_quality_api_key_str(self) -> Optional[str]:
+        """Get admin quality API key as string."""
+        if self.admin_quality_api_key:
+            return self.admin_quality_api_key.get_secret_value()
         return None
 
     @property
