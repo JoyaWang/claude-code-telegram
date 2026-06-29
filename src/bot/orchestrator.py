@@ -39,6 +39,7 @@ from ..claude.desktop_sessions import (
     extract_recent_messages,
 )
 from ..config.settings import Settings
+from ..integrations.admin_quality import AdminQualityClient, AdminQualityResult
 from ..projects import PrivateTopicsUnavailableError
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -48,6 +49,16 @@ from .utils.image_extractor import (
 )
 
 logger = structlog.get_logger()
+
+_QUALITY_COMMANDS = {
+    "queue",
+    "bugs",
+    "requirements",
+    "sessions",
+    "session",
+    "handle",
+}
+_DECISION_REPLY_PATTERN = re.compile(r"^\s*decision:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+\s*$")
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
@@ -317,6 +328,7 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("resume", self.agentic_resume),
         ]
+        handlers.extend((cmd, self.admin_quality_command) for cmd in _QUALITY_COMMANDS)
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
 
@@ -430,6 +442,12 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("resume", "Resume a desktop Claude Code session"),
+                BotCommand("queue", "Quality queue summary"),
+                BotCommand("bugs", "Quality bug queue"),
+                BotCommand("requirements", "Quality requirement queue"),
+                BotCommand("sessions", "Quality AI sessions"),
+                BotCommand("session", "Show a quality AI session"),
+                BotCommand("handle", "Create quality AI fix sessions"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -455,6 +473,85 @@ class MessageOrchestrator:
             return commands
 
     # --- Agentic handlers ---
+
+    async def admin_quality_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Forward quality-loop commands to admin-platform."""
+        await self._forward_admin_quality_update(update, context)
+
+    async def _forward_admin_quality_update(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> bool:
+        """Forward an update to admin-platform and reply only when needed."""
+        message = update.effective_message
+        if not message:
+            return False
+
+        user_id = update.effective_user.id if update.effective_user else 0
+        text = message.text or ""
+        command = text.strip().split(maxsplit=1)[0].lstrip("/").split("@")[0]
+
+        client = AdminQualityClient(
+            webhook_url=self.settings.admin_quality_webhook_url,
+            webhook_secret=self.settings.admin_quality_secret_str,
+            timeout_seconds=self.settings.admin_quality_timeout_seconds,
+        )
+        if not client.is_configured:
+            await message.reply_text(
+                "admin-platform 质量闭环尚未配置：请设置 "
+                "ADMIN_QUALITY_WEBHOOK_URL 后再使用该命令。"
+            )
+            await self._audit_admin_quality(context, user_id, command, [text], False)
+            return True
+
+        await message.chat.send_action("typing")
+        result = await client.forward_update(update)
+        await self._handle_admin_quality_result(message, result)
+        await self._audit_admin_quality(context, user_id, command, [text], result.ok)
+        return True
+
+    async def _handle_admin_quality_result(
+        self, message: Any, result: AdminQualityResult
+    ) -> None:
+        """Send a Telegram reply when admin-platform did not send one itself."""
+        if result.delivery_sent:
+            return
+
+        if result.reply:
+            await message.reply_text(result.reply, disable_web_page_preview=True)
+            return
+
+        if result.error:
+            await message.reply_text(
+                f"admin-platform 质量闭环请求失败：{result.error}"
+            )
+            return
+
+        if not result.ok:
+            await message.reply_text(
+                f"admin-platform 质量闭环请求失败，HTTP {result.status_code}。"
+            )
+            return
+
+        await message.reply_text("admin-platform 已接收该质量闭环请求。")
+
+    async def _audit_admin_quality(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        command: str,
+        args: List[str],
+        success: bool,
+    ) -> None:
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command=f"admin_quality:{command}",
+                args=args,
+                success=success,
+            )
 
     async def agentic_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1211,6 +1308,10 @@ class MessageOrchestrator:
                 parse_mode="HTML",
             )
             await self._send_intro(update, context, update.message.chat)
+            return
+
+        if _DECISION_REPLY_PATTERN.match(message_text):
+            await self._forward_admin_quality_update(update, context)
             return
 
         logger.info(

@@ -78,6 +78,7 @@ def test_security_relaxation_settings_defaults_and_overrides():
             telegram_bot_token="test_token",
             telegram_bot_username="test_bot",
             approved_directory=tmp_dir,
+            _env_file=None,
         )
         assert defaults.disable_security_patterns is False
         assert defaults.disable_tool_validation is False
@@ -88,9 +89,40 @@ def test_security_relaxation_settings_defaults_and_overrides():
             approved_directory=tmp_dir,
             disable_security_patterns=True,
             disable_tool_validation=True,
+            _env_file=None,
         )
         assert overridden.disable_security_patterns is True
         assert overridden.disable_tool_validation is True
+
+
+def test_admin_quality_settings_defaults_and_overrides():
+    """Admin quality forwarding is disabled by default and configurable."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        defaults = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            _env_file=None,
+        )
+        assert defaults.admin_quality_webhook_url is None
+        assert defaults.admin_quality_secret_str is None
+        assert defaults.admin_quality_timeout_seconds == 15
+
+        overridden = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            admin_quality_webhook_url="http://admin.local/api/quality/telegram-webhook",
+            admin_quality_webhook_secret="secret",
+            admin_quality_timeout_seconds=30,
+            _env_file=None,
+        )
+        assert (
+            overridden.admin_quality_webhook_url
+            == "http://admin.local/api/quality/telegram-webhook"
+        )
+        assert overridden.admin_quality_secret_str == "secret"
+        assert overridden.admin_quality_timeout_seconds == 30
 
 
 def test_approved_directory_validation_nonexistent():

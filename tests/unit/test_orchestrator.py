@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
+from src.integrations.admin_quality import AdminQualityResult
 from src.config import create_test_config
 
 
@@ -82,8 +83,8 @@ def deps():
     }
 
 
-def test_agentic_registers_5_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo commands."""
+def test_agentic_registers_agentic_and_quality_commands(agentic_settings, deps):
+    """Agentic mode registers core commands and quality-loop commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,12 +101,19 @@ def test_agentic_registers_5_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 5
+    assert len(cmd_handlers) == 12
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
+    assert frozenset({"resume"}) in commands
+    assert frozenset({"queue"}) in commands
+    assert frozenset({"bugs"}) in commands
+    assert frozenset({"requirements"}) in commands
+    assert frozenset({"sessions"}) in commands
+    assert frozenset({"session"}) in commands
+    assert frozenset({"handle"}) in commands
 
 
 def test_classic_registers_13_commands(classic_settings, deps):
@@ -150,18 +158,31 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 3 message handlers (text, document, photo)
     assert len(msg_handlers) == 3
-    # 1 callback handler (for cd: only)
-    assert len(cb_handlers) == 1
+    # cd:, new:, and resume: callback handlers are registered separately.
+    assert len(cb_handlers) == 3
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 5 bot commands."""
+    """Agentic mode returns core and quality-loop bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 5
+    assert len(commands) == 12
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo"]
+    assert cmd_names == [
+        "start",
+        "new",
+        "status",
+        "verbose",
+        "repo",
+        "resume",
+        "queue",
+        "bugs",
+        "requirements",
+        "sessions",
+        "session",
+        "handle",
+    ]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
@@ -206,8 +227,11 @@ async def test_agentic_start_no_keyboard(agentic_settings, deps):
 async def test_agentic_new_resets_session(agentic_settings, deps):
     """Agentic /new clears session and sends brief confirmation."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
+    project = agentic_settings.approved_directory / "demo"
+    project.mkdir()
 
     update = MagicMock()
+    update.message.text = "/new demo"
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
@@ -216,7 +240,8 @@ async def test_agentic_new_resets_session(agentic_settings, deps):
     await orchestrator.agentic_new(update, context)
 
     assert context.user_data["claude_session_id"] is None
-    update.message.reply_text.assert_called_once_with("Session reset. What's next?")
+    assert context.user_data["current_directory"] == project
+    update.message.reply_text.assert_called_once()
 
 
 async def test_agentic_status_compact(agentic_settings, deps):
@@ -235,7 +260,88 @@ async def test_agentic_status_compact(agentic_settings, deps):
 
     call_args = update.message.reply_text.call_args
     text = call_args.args[0]
-    assert "Session: none" in text
+    assert "No active session" in text
+
+
+async def test_admin_quality_command_requires_webhook_config(agentic_settings, deps):
+    """Quality commands fail closed when admin-platform webhook is not configured."""
+    settings = agentic_settings.model_copy(
+        update={
+            "admin_quality_webhook_url": None,
+            "admin_quality_webhook_secret": None,
+        }
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+    audit_logger = AsyncMock()
+    audit_logger.log_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_message = update.message
+    update.message.text = "/queue laicai prod"
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"audit_logger": audit_logger}
+
+    await orchestrator.admin_quality_command(update, context)
+
+    update.message.reply_text.assert_called_once()
+    assert "ADMIN_QUALITY_WEBHOOK_URL" in update.message.reply_text.call_args.args[0]
+    audit_logger.log_command.assert_called_once()
+    assert audit_logger.log_command.call_args.kwargs["success"] is False
+
+
+async def test_decision_text_forwards_to_admin_quality(monkeypatch, agentic_settings, deps):
+    """decision:<token>:<option> replies are forwarded instead of sent to Claude."""
+    settings = agentic_settings.model_copy(
+        update={"admin_quality_webhook_url": "http://admin.local/webhook"}
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    class FakeAdminQualityClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        @property
+        def is_configured(self):
+            return True
+
+        async def forward_update(self, update):
+            return AdminQualityResult(
+                status_code=200,
+                ok=True,
+                reply="decision accepted",
+                delivery_sent=False,
+            )
+
+    monkeypatch.setattr(
+        "src.bot.orchestrator.AdminQualityClient", FakeAdminQualityClient
+    )
+
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock()
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.effective_message = update.message
+    update.message.text = "decision:abc123:prod"
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "claude_integration": claude_integration,
+        "audit_logger": None,
+    }
+
+    await orchestrator.agentic_text(update, context)
+
+    claude_integration.run_command.assert_not_called()
+    update.message.reply_text.assert_called_once_with(
+        "decision accepted", disable_web_page_preview=True
+    )
 
 
 async def test_agentic_text_calls_claude(agentic_settings, deps):
@@ -310,10 +416,11 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 1
-    # The pattern attribute should match cd: prefixed data
-    assert cb_handlers[0].pattern is not None
-    assert cb_handlers[0].pattern.match("cd:my_project")
+    assert len(cb_handlers) == 3
+    patterns = [handler.pattern for handler in cb_handlers]
+    assert any(pattern and pattern.match("cd:my_project") for pattern in patterns)
+    assert any(pattern and pattern.match("new:my_project") for pattern in patterns)
+    assert any(pattern and pattern.match("resume:1") for pattern in patterns)
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):

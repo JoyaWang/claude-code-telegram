@@ -223,6 +223,23 @@ class Settings(BaseSettings):
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
     )
+    admin_quality_webhook_url: Optional[str] = Field(
+        None,
+        description=(
+            "Admin Platform quality Telegram webhook URL. When set, quality-loop "
+            "commands are forwarded there instead of Claude/Codex."
+        ),
+    )
+    admin_quality_webhook_secret: Optional[SecretStr] = Field(
+        None,
+        description="Secret sent as x-telegram-bot-api-secret-token to admin-platform",
+    )
+    admin_quality_timeout_seconds: int = Field(
+        15,
+        description="Timeout for admin-platform quality webhook requests",
+        ge=1,
+        le=120,
+    )
     enable_project_threads: bool = Field(
         False,
         description="Enable strict routing by Telegram forum project threads",
@@ -426,6 +443,13 @@ class Settings(BaseSettings):
         """Get auth token secret as string."""
         if self.auth_token_secret:
             return self.auth_token_secret.get_secret_value()
+        return None
+
+    @property
+    def admin_quality_secret_str(self) -> Optional[str]:
+        """Get admin quality webhook secret as string."""
+        if self.admin_quality_webhook_secret:
+            return self.admin_quality_webhook_secret.get_secret_value()
         return None
 
     @property
