@@ -68,6 +68,11 @@ async def test_outbox_relay_sends_claimed_delivery_and_marks_sent():
     assert "发到哪个环境？" in message
     assert "decision:decision-token:dev" in message
     assert "decision:decision-token:prod" in message
+    reply_markup = bot.send_message.call_args.kwargs["reply_markup"]
+    assert reply_markup.inline_keyboard[0][0].text == "发 dev"
+    assert reply_markup.inline_keyboard[0][0].callback_data == "decision:decision-token:dev"
+    assert reply_markup.inline_keyboard[0][1].text == "发 prod"
+    assert reply_markup.inline_keyboard[0][1].callback_data == "decision:decision-token:prod"
     assert client.calls[0] == (
         "claim_notification_delivery",
         {

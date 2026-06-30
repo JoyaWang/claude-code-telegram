@@ -358,6 +358,14 @@ class MessageOrchestrator:
             group=10,
         )
 
+        # quality:/decision: callbacks are owned by admin-platform.
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self.admin_quality_callback),
+                pattern=r"^(quality|decision):",
+            )
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -480,6 +488,15 @@ class MessageOrchestrator:
         """Forward quality-loop commands to admin-platform."""
         await self._forward_admin_quality_update(update, context)
 
+    async def admin_quality_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Forward quality-loop inline button callbacks to admin-platform."""
+        query = update.callback_query
+        if query:
+            await query.answer()
+        await self._forward_admin_quality_update(update, context)
+
     async def _forward_admin_quality_update(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> bool:
@@ -490,7 +507,12 @@ class MessageOrchestrator:
 
         user_id = update.effective_user.id if update.effective_user else 0
         text = message.text or ""
-        command = text.strip().split(maxsplit=1)[0].lstrip("/").split("@")[0]
+        callback_data = self._callback_data(update)
+        command = (
+            callback_data.split(":", 1)[0]
+            if callback_data
+            else text.strip().split(maxsplit=1)[0].lstrip("/").split("@")[0]
+        )
 
         client = AdminQualityClient(
             webhook_url=self.settings.admin_quality_webhook_url,
@@ -519,7 +541,11 @@ class MessageOrchestrator:
             return
 
         if result.reply:
-            await message.reply_text(result.reply, disable_web_page_preview=True)
+            reply_markup = self._admin_quality_reply_markup(result.reply_markup)
+            kwargs: Dict[str, Any] = {"disable_web_page_preview": True}
+            if reply_markup:
+                kwargs["reply_markup"] = reply_markup
+            await message.reply_text(result.reply, **kwargs)
             return
 
         if result.error:
@@ -535,6 +561,40 @@ class MessageOrchestrator:
             return
 
         await message.reply_text("admin-platform 已接收该质量闭环请求。")
+
+    @staticmethod
+    def _callback_data(update: Update) -> Optional[str]:
+        query = getattr(update, "callback_query", None)
+        data = getattr(query, "data", None) if query is not None else None
+        return data if isinstance(data, str) else None
+
+    @staticmethod
+    def _admin_quality_reply_markup(
+        payload: Optional[Dict[str, Any]]
+    ) -> Optional[InlineKeyboardMarkup]:
+        if not isinstance(payload, dict):
+            return None
+        rows = payload.get("inline_keyboard")
+        if not isinstance(rows, list):
+            return None
+
+        keyboard: List[List[InlineKeyboardButton]] = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            buttons: List[InlineKeyboardButton] = []
+            for button in row:
+                if not isinstance(button, dict):
+                    continue
+                text = button.get("text")
+                callback_data = button.get("callback_data")
+                if isinstance(text, str) and isinstance(callback_data, str):
+                    buttons.append(
+                        InlineKeyboardButton(text, callback_data=callback_data)
+                    )
+            if buttons:
+                keyboard.append(buttons)
+        return InlineKeyboardMarkup(keyboard) if keyboard else None
 
     async def _audit_admin_quality(
         self,

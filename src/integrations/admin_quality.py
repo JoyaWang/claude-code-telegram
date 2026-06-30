@@ -23,6 +23,7 @@ class AdminQualityResult:
     ok: bool
     reply: Optional[str]
     delivery_sent: bool
+    reply_markup: Optional[JsonDict] = None
     error: Optional[str] = None
 
 
@@ -52,6 +53,7 @@ class AdminQualityClient:
                 ok=False,
                 reply=None,
                 delivery_sent=False,
+                reply_markup=None,
                 error="ADMIN_QUALITY_WEBHOOK_URL is not configured",
             )
 
@@ -84,6 +86,7 @@ class AdminQualityClient:
                 ok=False,
                 reply=None,
                 delivery_sent=False,
+                reply_markup=None,
                 error=str(exc.reason),
             )
         except TimeoutError:
@@ -92,6 +95,7 @@ class AdminQualityClient:
                 ok=False,
                 reply=None,
                 delivery_sent=False,
+                reply_markup=None,
                 error="admin quality webhook request timed out",
             )
 
@@ -113,6 +117,10 @@ class AdminQualityClient:
         if not isinstance(reply, str) or not reply.strip():
             reply = None
 
+        reply_markup = data.get("reply_markup") or data.get("replyMarkup")
+        if not isinstance(reply_markup, dict):
+            reply_markup = None
+
         error = parsed.get("error") if isinstance(parsed, dict) else None
         if not isinstance(error, str) or not error.strip():
             error = None
@@ -122,12 +130,32 @@ class AdminQualityClient:
             ok=200 <= status_code < 300,
             reply=reply,
             delivery_sent=bool(delivery.get("sent")),
+            reply_markup=reply_markup,
             error=error,
         )
 
     @staticmethod
     def _payload_from_update(update: Update) -> JsonDict:
         """Create the subset of Telegram update JSON used by admin-platform."""
+        callback_query = _callback_query(update)
+        if callback_query:
+            message = getattr(callback_query, "message", None)
+            chat = getattr(message, "chat", None) if message else None
+            return {
+                "callback_query": {
+                    "id": getattr(callback_query, "id", None),
+                    "data": getattr(callback_query, "data", None),
+                    "message": {
+                        "message_id": getattr(message, "message_id", None),
+                        "chat": {
+                            "id": getattr(chat, "id", None),
+                            "type": getattr(chat, "type", None),
+                        },
+                    },
+                    "from": _user_payload(getattr(callback_query, "from_user", None)),
+                }
+            }
+
         message = update.effective_message
         chat = update.effective_chat
         user = update.effective_user
@@ -160,3 +188,9 @@ def _user_payload(user: Any) -> JsonDict:
         "first_name": getattr(user, "first_name", None),
     }
 
+
+def _callback_query(update: Update) -> Any:
+    query = getattr(update, "callback_query", None)
+    if query is None:
+        return None
+    return query if isinstance(getattr(query, "data", None), str) else None

@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import structlog
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 logger = structlog.get_logger()
@@ -197,11 +197,17 @@ class AdminQualityOutboxRelay:
 
         chat_id = self._resolve_chat_id(delivery)
         text = self._format_delivery(delivery)
+        reply_markup = self._decision_reply_markup(delivery)
         try:
+            kwargs: JsonDict = {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            if reply_markup:
+                kwargs["reply_markup"] = reply_markup
             message = await self.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                disable_web_page_preview=True,
+                **kwargs,
             )
         except TelegramError as exc:
             await self._mark_delivery(
@@ -240,7 +246,7 @@ class AdminQualityOutboxRelay:
         token = _optional_text(metadata.get("decisionToken"))
         options = metadata.get("options")
         if token and isinstance(options, list) and options:
-            lines.extend(["", "回复以下任一行继续："])
+            lines.extend(["", "可点击按钮，或回复以下任一行继续："])
             for option in options:
                 if not isinstance(option, dict):
                     continue
@@ -250,6 +256,34 @@ class AdminQualityOutboxRelay:
                 label = _optional_text(option.get("label")) or key
                 lines.append(f"decision:{token}:{key}  - {label}")
         return "\n".join(lines).strip()
+
+    def _decision_reply_markup(
+        self, delivery: JsonDict
+    ) -> Optional[InlineKeyboardMarkup]:
+        metadata = _metadata(delivery.get("metadata"))
+        token = _optional_text(metadata.get("decisionToken"))
+        options = metadata.get("options")
+        if not token or not isinstance(options, list):
+            return None
+
+        rows: List[List[InlineKeyboardButton]] = []
+        current_row: List[InlineKeyboardButton] = []
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            key = _optional_text(option.get("key"))
+            if not key:
+                continue
+            label = _optional_text(option.get("label")) or key
+            current_row.append(
+                InlineKeyboardButton(label, callback_data=f"decision:{token}:{key}")
+            )
+            if len(current_row) == 2:
+                rows.append(current_row)
+                current_row = []
+        if current_row:
+            rows.append(current_row)
+        return InlineKeyboardMarkup(rows) if rows else None
 
     async def _mark_delivery(
         self,

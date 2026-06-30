@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.bot.orchestrator import MessageOrchestrator, _redact_secrets
-from src.integrations.admin_quality import AdminQualityResult
+from src.integrations.admin_quality import AdminQualityClient, AdminQualityResult
 from src.config import create_test_config
 
 
@@ -135,6 +135,41 @@ def test_classic_registers_13_commands(classic_settings, deps):
     assert len(cmd_handlers) == 13
 
 
+def test_admin_quality_client_serializes_callback_query():
+    """Callback queries are forwarded with callback_query data, not message text."""
+    update = MagicMock()
+    update.effective_message = update.message
+    update.effective_chat.id = 10001
+    update.effective_chat.type = "private"
+    update.effective_user.id = 7277903805
+    update.callback_query.data = "quality:queue:laicai:prod"
+    update.callback_query.id = "callback-1"
+    update.callback_query.from_user.id = 7277903805
+    update.callback_query.from_user.username = None
+    update.callback_query.from_user.first_name = None
+    update.callback_query.message.message_id = 10
+    update.callback_query.message.chat.id = 10001
+    update.callback_query.message.chat.type = "private"
+
+    payload = AdminQualityClient._payload_from_update(update)
+
+    assert payload == {
+        "callback_query": {
+            "id": "callback-1",
+            "data": "quality:queue:laicai:prod",
+            "message": {
+                "message_id": 10,
+                "chat": {"id": 10001, "type": "private"},
+            },
+            "from": {
+                "id": 7277903805,
+                "username": None,
+                "first_name": None,
+            },
+        }
+    }
+
+
 def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
     """Agentic mode registers text, document, and photo message handlers."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
@@ -158,8 +193,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 3 message handlers (text, document, photo)
     assert len(msg_handlers) == 3
-    # cd:, new:, and resume: callback handlers are registered separately.
-    assert len(cb_handlers) == 3
+    # quality:/decision:, cd:, new:, and resume: callback handlers are registered separately.
+    assert len(cb_handlers) == 4
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -344,6 +379,93 @@ async def test_decision_text_forwards_to_admin_quality(monkeypatch, agentic_sett
     )
 
 
+async def test_admin_quality_result_renders_inline_keyboard(agentic_settings, deps):
+    """Admin quality webhook reply_markup is rendered as a Telegram keyboard."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+
+    result = AdminQualityResult(
+        status_code=200,
+        ok=True,
+        reply="请选择项目和环境",
+        delivery_sent=False,
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Laicai prod",
+                        "callback_data": "quality:queue:laicai:prod",
+                    }
+                ]
+            ]
+        },
+    )
+
+    await orchestrator._handle_admin_quality_result(message, result)
+
+    message.reply_text.assert_called_once()
+    assert message.reply_text.call_args.args[0] == "请选择项目和环境"
+    reply_markup = message.reply_text.call_args.kwargs["reply_markup"]
+    assert reply_markup.inline_keyboard[0][0].text == "Laicai prod"
+    assert (
+        reply_markup.inline_keyboard[0][0].callback_data
+        == "quality:queue:laicai:prod"
+    )
+
+
+async def test_quality_callback_forwards_to_admin_platform(
+    monkeypatch, agentic_settings, deps
+):
+    """quality:* inline button callbacks are forwarded to admin-platform."""
+    settings = agentic_settings.model_copy(
+        update={"admin_quality_webhook_url": "http://admin.local/webhook"}
+    )
+    orchestrator = MessageOrchestrator(settings, deps)
+
+    class FakeAdminQualityClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        @property
+        def is_configured(self):
+            return True
+
+        async def forward_update(self, update):
+            return AdminQualityResult(
+                status_code=200,
+                ok=True,
+                reply="laicai prod 当前待处理 0 项",
+                delivery_sent=False,
+            )
+
+    monkeypatch.setattr(
+        "src.bot.orchestrator.AdminQualityClient", FakeAdminQualityClient
+    )
+
+    query = MagicMock()
+    query.data = "quality:queue:laicai:prod"
+    query.answer = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user.id = 123
+    update.effective_message = update.message
+    update.message.text = None
+    update.message.chat.send_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.bot_data = {"audit_logger": None}
+
+    await orchestrator.admin_quality_callback(update, context)
+
+    query.answer.assert_awaited_once()
+    update.message.reply_text.assert_called_once_with(
+        "laicai prod 当前待处理 0 项", disable_web_page_preview=True
+    )
+
+
 async def test_agentic_text_calls_claude(agentic_settings, deps):
     """Agentic text handler calls Claude and returns response without keyboard."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
@@ -416,8 +538,10 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 3
+    assert len(cb_handlers) == 4
     patterns = [handler.pattern for handler in cb_handlers]
+    assert any(pattern and pattern.match("quality:queue:laicai:prod") for pattern in patterns)
+    assert any(pattern and pattern.match("decision:token:prod") for pattern in patterns)
     assert any(pattern and pattern.match("cd:my_project") for pattern in patterns)
     assert any(pattern and pattern.match("new:my_project") for pattern in patterns)
     assert any(pattern and pattern.match("resume:1") for pattern in patterns)

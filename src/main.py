@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import re
 import signal
 import sys
 from pathlib import Path
@@ -43,6 +44,25 @@ from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
 
 
+_TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"/bot[0-9]+:[A-Za-z0-9_-]+")
+
+
+def _redact_log_message(value: object) -> object:
+    """Redact Telegram Bot API tokens from standard library log records."""
+    if not isinstance(value, str):
+        return value
+    return _TELEGRAM_BOT_TOKEN_PATTERN.sub("/bot***", value)
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Prevent third-party HTTP logs from writing bot tokens to stdout."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_log_message(record.getMessage())
+        record.args = ()
+        return True
+
+
 def setup_logging(debug: bool = False) -> None:
     """Configure structured logging."""
     level = logging.DEBUG if debug else logging.INFO
@@ -53,6 +73,11 @@ def setup_logging(debug: bool = False) -> None:
         format="%(message)s",
         stream=sys.stdout,
     )
+    redaction_filter = SecretRedactionFilter()
+    root_logger = logging.getLogger()
+    root_logger.addFilter(redaction_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(redaction_filter)
 
     # Configure structlog
     structlog.configure(
